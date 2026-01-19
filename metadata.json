@@ -1,0 +1,5 @@
+{
+  "name": "REM & WHT analyzer",
+  "description": "An interactive, real-time code editor and previewer for HTML, CSS, and JavaScript. Paste your source code into the designated editors and instantly see the rendered output, making it easy to test snippets and prototype web ideas.",
+  "requestFramePermissions": []
+}
