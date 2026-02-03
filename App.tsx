@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { GoogleGenAI, Type } from "@google/genai";
 
 // --- Type Definitions ---
@@ -41,6 +41,9 @@ const App: React.FC = () => {
     const [scannerResults, setScannerResults] = useState<ScannerResult[]>([]);
     const [scannerMessages, setScannerMessages] = useState<{ text: string, type: 'error' | 'success' | 'warning' }[]>([]);
     const [showDownloadModal, setShowDownloadModal] = useState(false);
+    const [showAuthError, setShowAuthError] = useState(false);
+    
+    const abortControllerRef = useRef<AbortController | null>(null);
     
     // --- Handlers & Logic ---
     
@@ -49,6 +52,7 @@ const App: React.FC = () => {
         setSelectedFiles(Array.from(files));
         setScannerResults([]);
         setScannerMessages([]);
+        setShowAuthError(false);
     };
     
     const handleDragOver = (e: React.DragEvent) => e.preventDefault();
@@ -58,16 +62,24 @@ const App: React.FC = () => {
     };
 
     const processFiles = () => {
+        setShowAuthError(false);
         processReceipts();
+    };
+
+    const handleFixKey = async () => {
+        if ((window as any).aistudio && (window as any).aistudio.openSelectKey) {
+            try {
+                await (window as any).aistudio.openSelectKey();
+                setShowAuthError(false);
+                setScannerMessages(prev => [...prev, { text: "API Key updated. You can now try processing again.", type: 'success' }]);
+            } catch (e) {
+                console.error("Failed to select key", e);
+            }
+        }
     };
     
     const handleChangeKey = async () => {
-        if ((window as any).aistudio && (window as any).aistudio.openSelectKey) {
-            await (window as any).aistudio.openSelectKey();
-            setScannerMessages(prev => [...prev, { text: "API Key updated. Please try processing again.", type: 'success' }]);
-        } else {
-            alert("Key selection is not supported in this preview environment.");
-        }
+        await handleFixKey();
     };
     
     // --- Scanner Logic ---
@@ -82,21 +94,30 @@ const App: React.FC = () => {
 
         if (!process.env.API_KEY) {
              setScannerMessages([{ text: "API Key not found. Please ensure you have selected a valid API key.", type: 'error' }]);
+             setShowAuthError(true);
              return;
         }
 
         // Initialize AI client locally with the current key
+        // We create it fresh every time we start processing
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
         setScannerIsLoading(true);
         setScannerMessages([]);
         setScannerResults([]);
+        setShowAuthError(false);
+        
+        // Setup abort controller for cancellation if needed (though we rely on loop break)
+        abortControllerRef.current = new AbortController();
 
-        // Deduplication Set: Stores keys formatted as "receiptNumber-amount"
+        // Deduplication Set
         const uniqueKeys = new Set<string>();
         const results: ScannerResult[] = [];
+        let criticalErrorOccurred = false;
 
         for (const file of selectedFiles) {
+            if (criticalErrorOccurred) break;
+
             const maxSize = 19 * 1024 * 1024; // 19MB
             if (file.size > maxSize) {
                 setScannerMessages(prev => [...prev, { text: `File skipped (too large): ${file.name}`, type: 'warning' }]);
@@ -111,7 +132,8 @@ const App: React.FC = () => {
 
             try {
                 const base64Data = await fileToBase64(file);
-                // Now expecting an array of results
+                
+                // Call API
                 const fileResults = await callScannerGeminiAPI(ai, base64Data, mimeType);
                 
                 let addedCount = 0;
@@ -119,10 +141,7 @@ const App: React.FC = () => {
                      for (const result of fileResults) {
                         if (result && result.companyName) {
                             const uniqueKey = `${result.receiptNumber.trim()}-${result.amount}`;
-                            
-                            if (uniqueKeys.has(uniqueKey)) {
-                                 // Duplicate found, silently skip to avoid spamming messages for multi-page docs
-                            } else {
+                            if (!uniqueKeys.has(uniqueKey)) {
                                 uniqueKeys.add(uniqueKey);
                                 results.push(result);
                                 addedCount++;
@@ -141,30 +160,30 @@ const App: React.FC = () => {
                 }
 
             } catch (error: any) {
-                 const errorText = error.message || JSON.stringify(error);
-                 // Check specifically for API Key errors to prompt re-selection
-                 if (errorText.includes("API_KEY_INVALID") || errorText.includes("Requested entity was not found") || errorText.includes("403")) {
-                     setScannerMessages(prev => [...prev, { text: `API Key Invalid. Prompting for new key...`, type: 'error' }]);
-                     
-                     if ((window as any).aistudio && (window as any).aistudio.openSelectKey) {
-                         await (window as any).aistudio.openSelectKey();
-                         setScannerMessages(prev => [...prev, { text: `Key updated. Please click 'Process Files' again.`, type: 'warning' }]);
-                     }
-                     // Stop processing subsequent files to prevent spamming errors
-                     setScannerIsLoading(false);
-                     return;
+                 const rawErrorText = error.message || error.toString() || "";
+                 const errorText = rawErrorText.toLowerCase();
+
+                 // Critical Auth Errors
+                 if (
+                     errorText.includes("api_key") || 
+                     errorText.includes("403") || 
+                     errorText.includes("invalid_argument") || 
+                     errorText.includes("requested entity was not found")
+                 ) {
+                     setScannerMessages(prev => [...prev, { text: `CRITICAL: API Key Invalid while processing ${file.name}. Processing stopped.`, type: 'error' }]);
+                     criticalErrorOccurred = true;
+                     setShowAuthError(true);
+                     break; // STOP THE LOOP
                  }
                  
-                 // Clean up error message if it is a JSON string
+                 // Non-Critical Errors
                  let displayMsg = error.message;
                  try {
                      const jsonError = JSON.parse(error.message);
                      if (jsonError.error && jsonError.error.message) {
                          displayMsg = jsonError.error.message;
                      }
-                 } catch (e) {
-                     // Not JSON, use original
-                 }
+                 } catch (e) { /* ignore */ }
 
                  setScannerMessages(prev => [...prev, { text: `Failed to process file: ${file.name}. ${displayMsg}`, type: 'error' }]);
             }
@@ -176,25 +195,18 @@ const App: React.FC = () => {
     };
     
     const callScannerGeminiAPI = async (ai: GoogleGenAI, base64Data: string, mimeType: string): Promise<ScannerResult[]> => {
-        const systemPrompt = `You are an expert accountant. This file may contain one or multiple receipts (e.g., a multi-page PDF or merged images). 
-        Extract the following fields for EACH receipt found in the document.
+        const systemPrompt = `You are an expert accountant. This file may contain one or multiple receipts. 
+        Extract the following fields for EACH receipt found.
 
         - companyName: The name of the company that made the payment.
-        - paymentDate: The date the payment was made (e.g., "21/01/2025"). Use ISO format YYYY-MM-DD.
-        - paymentPeriod: The month/year the payment covers (e.g., "Jan-25"). If not explicitly stated, infer it as the month PRIOR to the paymentDate. For a payment in "January 2024", the period is "Dec-23".
-        - receiptNumber: The unique receipt or transaction number. Do NOT use the "AssessRef" or "Assessment Reference". Prioritize the "Transaction" number or "Receipt No". Extract the FULL alphanumeric string found (e.g., "LGR00012345678"). Do not truncate it.
-        - taxType: The specific type of tax paid. Look closely at "Agency - Rev Code", "Service Description", or "Payment Details". Examples: "Development Levy", "WHT ON DIRECTOR'S FEES", "PAYE", "Business Premises". If the text says "Pay As You Earn" or "P.A.Y.E", return just "PAYE". Do NOT use generic terms like "Lagos Revenue Payment" or "Revenue Receipt" if a specific tax name (like "Development Levy") is visible.
-        - state: The State or Authority that issued the receipt. Scan the header, footer, and body text. Look for specific state names or URLs (e.g., "deltarevenue.com").
-          - If "Delta State", "Delta Revenue", or "deltarevenue.com" appears, return "Delta".
-          - If "Lagos State", "LIRS", or "lirs.gov.ng" appears, return "Lagos".
-          - If "Ogun State" appears, return "Ogun".
-          - If "Rivers State" appears, return "Rivers".
-          - If "Abuja", "FCT", "Federal Capital Territory", or "FCT-IRS" appears, return "FCT".
-          - If "FIRS" or "Federal Inland Revenue" appears, return "Federal".
-          Return just the main name (e.g., "Lagos", "Delta", "Federal", "Ogun", "Rivers", "FCT").
-        - amount: The FINAL TOTAL amount paid. If the receipt has multiple amount fields (like 'Amount', 'Charges', 'VAT', 'Total'), you MUST select the 'Total', 'Total Paid', or 'Total Amount'. For example, if 'Amount' is 900 and 'Total' is 950, return 950.
+        - paymentDate: The date the payment was made (ISO YYYY-MM-DD).
+        - paymentPeriod: The month/year the payment covers (e.g., "Jan-25").
+        - receiptNumber: The unique receipt or transaction number.
+        - taxType: The specific type of tax paid (e.g., "PAYE", "WHT").
+        - state: The State or Authority (e.g., "Lagos", "Delta", "Federal").
+        - amount: The FINAL TOTAL amount paid.
         
-        Return a valid JSON ARRAY of objects. If only one receipt is found, return an array containing that single object. Do not add markdown or any other text.`;
+        Return a valid JSON ARRAY of objects.`;
         
         const response = await ai.models.generateContent({
             model: 'gemini-2.5-flash',
@@ -209,7 +221,7 @@ const App: React.FC = () => {
                         properties: {
                             "companyName": { "type": Type.STRING },
                             "paymentDate": { "type": Type.STRING, "description": "Date in YYYY-MM-DD format" },
-                            "paymentPeriod": { "type": Type.STRING, "description": "Period in Mon-YY format (e.g., Jan-25)" },
+                            "paymentPeriod": { "type": Type.STRING, "description": "Period in Mon-YY format" },
                             "receiptNumber": { "type": Type.STRING },
                             "taxType": { "type": Type.STRING },
                             "state": { "type": Type.STRING },
@@ -466,6 +478,37 @@ const App: React.FC = () => {
 
     return (
         <div className="w-full max-w-7xl mx-auto relative">
+            {/* Modal for API Key Error */}
+            {showAuthError && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md">
+                    <div className="bg-slate-900 border border-red-500/50 rounded-xl p-6 max-w-md w-full shadow-2xl glow-border">
+                        <div className="flex items-center gap-3 text-red-400 mb-4">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                            </svg>
+                            <h3 className="text-xl font-bold">Authentication Failed</h3>
+                        </div>
+                        <p className="text-slate-300 mb-6">
+                            Your API key is missing or invalid. Please select a valid paid API key to continue processing.
+                        </p>
+                        <div className="space-y-3">
+                            <button
+                                onClick={handleFixKey}
+                                className="w-full py-3 px-4 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold transition-colors flex items-center justify-center shadow-lg shadow-red-900/50"
+                            >
+                                <span className="mr-2">🔑</span> Fix API Key Now
+                            </button>
+                            <button
+                                onClick={() => setShowAuthError(false)}
+                                className="w-full py-2 text-slate-500 hover:text-slate-300 text-sm"
+                            >
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {showDownloadModal && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
                     <div className="bg-slate-900 border border-white/10 rounded-xl p-6 max-w-md w-full shadow-2xl glow-border">
