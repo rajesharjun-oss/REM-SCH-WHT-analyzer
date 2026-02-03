@@ -1,5 +1,20 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Type } from "@google/genai";
+
+// --- PRODUCTION CONFIGURATION ---
+// To make this work for users without them entering keys, 
+// fill in ONE of the following options directly in the code:
+
+// OPTION 1: Server Mode (Secure - Recommended)
+// Deploy the backend and paste the URL here.
+const DEFAULT_BACKEND_URL = ""; 
+
+// OPTION 2: Client Demo Mode (Easiest for testing)
+// Paste your API Key here. 
+// WARNING: This key is visible to anyone who views the source code.
+const HARDCODED_API_KEY = "AIzaSyBjA-yXiXD5TEsr7gejn5XT2mGgDs6WL48"; 
+
+// --------------------------------
 
 // --- Type Definitions ---
 interface ScannerResult {
@@ -10,7 +25,7 @@ interface ScannerResult {
     receiptNumber: string;
     taxType: string;
     amount: number;
-    state: string; // New field for State/Authority
+    state: string; 
 }
 
 // --- Helper Functions ---
@@ -36,15 +51,18 @@ const App: React.FC = () => {
     // --- Global State ---
     const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
     
+    // --- Config State (Derived from constants) ---
+    // If a backend URL is provided, we prefer Server Mode.
+    const useServerMode = !!DEFAULT_BACKEND_URL;
+    
     // --- Scanner State ---
     const [scannerIsLoading, setScannerIsLoading] = useState(false);
     const [scannerResults, setScannerResults] = useState<ScannerResult[]>([]);
     const [scannerMessages, setScannerMessages] = useState<{ text: string, type: 'error' | 'success' | 'warning' }[]>([]);
     const [showDownloadModal, setShowDownloadModal] = useState(false);
-    const [showAuthError, setShowAuthError] = useState(false);
     
     const abortControllerRef = useRef<AbortController | null>(null);
-    
+
     // --- Handlers & Logic ---
     
     const handleFileChange = (files: FileList | null) => {
@@ -52,7 +70,6 @@ const App: React.FC = () => {
         setSelectedFiles(Array.from(files));
         setScannerResults([]);
         setScannerMessages([]);
-        setShowAuthError(false);
     };
     
     const handleDragOver = (e: React.DragEvent) => e.preventDefault();
@@ -62,63 +79,41 @@ const App: React.FC = () => {
     };
 
     const processFiles = () => {
-        setShowAuthError(false);
         processReceipts();
-    };
-
-    const handleFixKey = async () => {
-        if ((window as any).aistudio && (window as any).aistudio.openSelectKey) {
-            try {
-                await (window as any).aistudio.openSelectKey();
-                setShowAuthError(false);
-                setScannerMessages(prev => [...prev, { text: "API Key updated. You can now try processing again.", type: 'success' }]);
-            } catch (e) {
-                console.error("Failed to select key", e);
-            }
-        }
-    };
-    
-    const handleChangeKey = async () => {
-        await handleFixKey();
     };
     
     // --- Scanner Logic ---
     const processReceipts = async () => {
-        // --- API Key Check & Selection ---
-        if ((window as any).aistudio && (window as any).aistudio.hasSelectedApiKey && (window as any).aistudio.openSelectKey) {
-            const hasKey = await (window as any).aistudio.hasSelectedApiKey();
-            if (!hasKey) {
-                await (window as any).aistudio.openSelectKey();
-            }
-        }
+        
+        // 1. Setup API Access
+        let ai: GoogleGenAI | null = null;
+        const apiKey = HARDCODED_API_KEY || (import.meta as any).env?.VITE_API_KEY || process.env.API_KEY;
 
-        if (!process.env.API_KEY) {
-             setScannerMessages([{ text: "API Key not found. Please ensure you have selected a valid API key.", type: 'error' }]);
-             setShowAuthError(true);
+        if (!useServerMode) {
+             if (!apiKey) {
+                 setScannerMessages([{ text: "Setup Error: No API Key configured in code. Please add HARDCODED_API_KEY in App.tsx.", type: 'error' }]);
+                 return;
+             }
+             ai = new GoogleGenAI({ apiKey: apiKey });
+        } else if (!DEFAULT_BACKEND_URL) {
+             setScannerMessages([{ text: "Setup Error: Server Mode enabled but no URL configured.", type: 'error' }]);
              return;
         }
-
-        // Initialize AI client locally with the current key
-        // We create it fresh every time we start processing
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
         setScannerIsLoading(true);
         setScannerMessages([]);
         setScannerResults([]);
-        setShowAuthError(false);
         
-        // Setup abort controller for cancellation if needed (though we rely on loop break)
         abortControllerRef.current = new AbortController();
-
-        // Deduplication Set
         const uniqueKeys = new Set<string>();
         const results: ScannerResult[] = [];
         let criticalErrorOccurred = false;
 
+        // 2. Process Loop
         for (const file of selectedFiles) {
             if (criticalErrorOccurred) break;
 
-            const maxSize = 19 * 1024 * 1024; // 19MB
+            const maxSize = useServerMode ? 30 * 1024 * 1024 : 19 * 1024 * 1024; // Higher limit for server
             if (file.size > maxSize) {
                 setScannerMessages(prev => [...prev, { text: `File skipped (too large): ${file.name}`, type: 'warning' }]);
                 continue;
@@ -131,11 +126,39 @@ const App: React.FC = () => {
             }
 
             try {
-                const base64Data = await fileToBase64(file);
+                let fileResults: ScannerResult[] = [];
+
+                if (useServerMode) {
+                    // --- SERVER STRATEGY ---
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    
+                    try {
+                        const response = await fetch(DEFAULT_BACKEND_URL, {
+                            method: 'POST',
+                            body: formData,
+                            signal: abortControllerRef.current.signal
+                        });
+
+                        if (!response.ok) {
+                            throw new Error(`Server Error (${response.status})`);
+                        }
+
+                        const json = await response.json();
+                        const rawData = Array.isArray(json) ? json : (json.results || [json]);
+                        fileResults = processRawData(rawData);
+
+                    } catch (serverErr: any) {
+                        throw new Error(`Connection Failed: ${serverErr.message}.`);
+                    }
+
+                } else if (ai) {
+                    // --- CLIENT STRATEGY ---
+                    const base64Data = await fileToBase64(file);
+                    fileResults = await callScannerGeminiAPI(ai, base64Data, mimeType);
+                }
                 
-                // Call API
-                const fileResults = await callScannerGeminiAPI(ai, base64Data, mimeType);
-                
+                // 3. Merge Results
                 let addedCount = 0;
                 if (fileResults && fileResults.length > 0) {
                      for (const result of fileResults) {
@@ -163,26 +186,17 @@ const App: React.FC = () => {
                  const rawErrorText = error.message || error.toString() || "";
                  const errorText = rawErrorText.toLowerCase();
 
-                 // Critical Auth Errors
-                 if (
-                     errorText.includes("api_key") || 
-                     errorText.includes("403") || 
-                     errorText.includes("invalid_argument") || 
-                     errorText.includes("requested entity was not found")
-                 ) {
-                     setScannerMessages(prev => [...prev, { text: `CRITICAL: API Key Invalid while processing ${file.name}. Processing stopped.`, type: 'error' }]);
+                 if (errorText.includes("api_key") || errorText.includes("403")) {
+                     setScannerMessages(prev => [...prev, { text: `Authentication Error: The API key is invalid or expired.`, type: 'error' }]);
                      criticalErrorOccurred = true;
-                     setShowAuthError(true);
-                     break; // STOP THE LOOP
+                     break; 
                  }
                  
-                 // Non-Critical Errors
+                 // Display Error
                  let displayMsg = error.message;
                  try {
                      const jsonError = JSON.parse(error.message);
-                     if (jsonError.error && jsonError.error.message) {
-                         displayMsg = jsonError.error.message;
-                     }
+                     if (jsonError.error && jsonError.error.message) displayMsg = jsonError.error.message;
                  } catch (e) { /* ignore */ }
 
                  setScannerMessages(prev => [...prev, { text: `Failed to process file: ${file.name}. ${displayMsg}`, type: 'error' }]);
@@ -192,6 +206,22 @@ const App: React.FC = () => {
         results.sort((a, b) => new Date(a.paymentDate).getTime() - new Date(b.paymentDate).getTime());
         setScannerResults(results);
         setScannerIsLoading(false);
+    };
+
+    // Shared processing logic to normalize data from AI (Client or Server)
+    const processRawData = (data: any[]): ScannerResult[] => {
+        return data.map((item: any) => {
+             if (!item.paymentPeriod && item.paymentDate) {
+                const date = new Date(item.paymentDate);
+                date.setMonth(date.getMonth() - 1);
+                item.paymentPeriod = `${date.toLocaleString('default', { month: 'short' })}-${date.getFullYear().toString().slice(-2)}`;
+            }
+            if (item.paymentDate) {
+                const date = new Date(item.paymentDate);
+                item.paymentDateDisplay = `${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()}`;
+            }
+            return item;
+        }) as ScannerResult[];
     };
     
     const callScannerGeminiAPI = async (ai: GoogleGenAI, base64Data: string, mimeType: string): Promise<ScannerResult[]> => {
@@ -247,18 +277,7 @@ const App: React.FC = () => {
             return [];
         }
         
-        return data.map((item: any) => {
-             if (!item.paymentPeriod && item.paymentDate) {
-                const date = new Date(item.paymentDate);
-                date.setMonth(date.getMonth() - 1);
-                item.paymentPeriod = `${date.toLocaleString('default', { month: 'short' })}-${date.getFullYear().toString().slice(-2)}`;
-            }
-            if (item.paymentDate) {
-                const date = new Date(item.paymentDate);
-                item.paymentDateDisplay = `${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()}`;
-            }
-            return item;
-        }) as ScannerResult[];
+        return processRawData(data);
     };
     
     const handleDownloadClick = () => {
@@ -478,37 +497,9 @@ const App: React.FC = () => {
 
     return (
         <div className="w-full max-w-7xl mx-auto relative">
-            {/* Modal for API Key Error */}
-            {showAuthError && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md">
-                    <div className="bg-slate-900 border border-red-500/50 rounded-xl p-6 max-w-md w-full shadow-2xl glow-border">
-                        <div className="flex items-center gap-3 text-red-400 mb-4">
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                            </svg>
-                            <h3 className="text-xl font-bold">Authentication Failed</h3>
-                        </div>
-                        <p className="text-slate-300 mb-6">
-                            Your API key is missing or invalid. Please select a valid paid API key to continue processing.
-                        </p>
-                        <div className="space-y-3">
-                            <button
-                                onClick={handleFixKey}
-                                className="w-full py-3 px-4 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold transition-colors flex items-center justify-center shadow-lg shadow-red-900/50"
-                            >
-                                <span className="mr-2">🔑</span> Fix API Key Now
-                            </button>
-                            <button
-                                onClick={() => setShowAuthError(false)}
-                                className="w-full py-2 text-slate-500 hover:text-slate-300 text-sm"
-                            >
-                                Cancel
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
+            {/* Modal for Configuration Removed */}
 
+            {/* Modal for Download Selection */}
             {showDownloadModal && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
                     <div className="bg-slate-900 border border-white/10 rounded-xl p-6 max-w-md w-full shadow-2xl glow-border">
@@ -541,14 +532,6 @@ const App: React.FC = () => {
             <header className="mb-8 text-center border-b border-white/10 pb-6 relative">
                 <h1 className="text-4xl font-bold text-slate-100 tracking-wider">REMITTANCE SCHEDULE AI</h1>
                 <p className="text-slate-400 mt-2">Your personal AI-powered toolkit.</p>
-                <div className="absolute right-0 top-0 mt-2 mr-2">
-                    <button onClick={handleChangeKey} className="text-xs text-slate-500 hover:text-violet-400 flex items-center gap-1 transition-colors">
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z" />
-                        </svg>
-                        Change API Key
-                    </button>
-                </div>
             </header>
             
             <main>
