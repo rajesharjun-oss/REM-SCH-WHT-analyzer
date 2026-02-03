@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { GoogleGenAI, Type } from "@google/genai";
 
 // --- Type Definitions ---
@@ -35,13 +35,6 @@ const formatCurrency = (amount: number) => {
 const App: React.FC = () => {
     // --- Global State ---
     const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-    const [ai, setAi] = useState<GoogleGenAI | null>(null);
-
-    useEffect(() => {
-        if (process.env.API_KEY) {
-            setAi(new GoogleGenAI({ apiKey: process.env.API_KEY }));
-        }
-    }, []);
     
     // --- Scanner State ---
     const [scannerIsLoading, setScannerIsLoading] = useState(false);
@@ -68,12 +61,33 @@ const App: React.FC = () => {
         processReceipts();
     };
     
+    const handleChangeKey = async () => {
+        if ((window as any).aistudio && (window as any).aistudio.openSelectKey) {
+            await (window as any).aistudio.openSelectKey();
+            setScannerMessages(prev => [...prev, { text: "API Key updated. Please try processing again.", type: 'success' }]);
+        } else {
+            alert("Key selection is not supported in this preview environment.");
+        }
+    };
+    
     // --- Scanner Logic ---
     const processReceipts = async () => {
-        if (!ai) {
-            setScannerMessages([{ text: "AI client not initialized.", type: 'error' }]);
-            return;
+        // --- API Key Check & Selection ---
+        if ((window as any).aistudio && (window as any).aistudio.hasSelectedApiKey && (window as any).aistudio.openSelectKey) {
+            const hasKey = await (window as any).aistudio.hasSelectedApiKey();
+            if (!hasKey) {
+                await (window as any).aistudio.openSelectKey();
+            }
         }
+
+        if (!process.env.API_KEY) {
+             setScannerMessages([{ text: "API Key not found. Please ensure you have selected a valid API key.", type: 'error' }]);
+             return;
+        }
+
+        // Initialize AI client locally with the current key
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
         setScannerIsLoading(true);
         setScannerMessages([]);
         setScannerResults([]);
@@ -127,7 +141,32 @@ const App: React.FC = () => {
                 }
 
             } catch (error: any) {
-                 setScannerMessages(prev => [...prev, { text: `Failed to process file: ${file.name}. ${error.message}`, type: 'error' }]);
+                 const errorText = error.message || JSON.stringify(error);
+                 // Check specifically for API Key errors to prompt re-selection
+                 if (errorText.includes("API_KEY_INVALID") || errorText.includes("Requested entity was not found") || errorText.includes("403")) {
+                     setScannerMessages(prev => [...prev, { text: `API Key Invalid. Prompting for new key...`, type: 'error' }]);
+                     
+                     if ((window as any).aistudio && (window as any).aistudio.openSelectKey) {
+                         await (window as any).aistudio.openSelectKey();
+                         setScannerMessages(prev => [...prev, { text: `Key updated. Please click 'Process Files' again.`, type: 'warning' }]);
+                     }
+                     // Stop processing subsequent files to prevent spamming errors
+                     setScannerIsLoading(false);
+                     return;
+                 }
+                 
+                 // Clean up error message if it is a JSON string
+                 let displayMsg = error.message;
+                 try {
+                     const jsonError = JSON.parse(error.message);
+                     if (jsonError.error && jsonError.error.message) {
+                         displayMsg = jsonError.error.message;
+                     }
+                 } catch (e) {
+                     // Not JSON, use original
+                 }
+
+                 setScannerMessages(prev => [...prev, { text: `Failed to process file: ${file.name}. ${displayMsg}`, type: 'error' }]);
             }
         }
         
@@ -456,13 +495,21 @@ const App: React.FC = () => {
                 </div>
             )}
             
-            <header className="mb-8 text-center border-b border-white/10 pb-6">
+            <header className="mb-8 text-center border-b border-white/10 pb-6 relative">
                 <h1 className="text-4xl font-bold text-slate-100 tracking-wider">REMITTANCE SCHEDULE AI</h1>
                 <p className="text-slate-400 mt-2">Your personal AI-powered toolkit.</p>
+                <div className="absolute right-0 top-0 mt-2 mr-2">
+                    <button onClick={handleChangeKey} className="text-xs text-slate-500 hover:text-violet-400 flex items-center gap-1 transition-colors">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z" />
+                        </svg>
+                        Change API Key
+                    </button>
+                </div>
             </header>
             
             <main>
-                <div className="bg-slate-900/50 backdrop-blur-sm rounded-xl shadow-lg p-6 mb-8 glow-border">
+                <div className="bg-slate-900/50 backdrop-blur-sm rounded-xl shadow-lg p-6 mb-8 glow-border max-w-2xl mx-auto">
                     <div 
                         onDragOver={handleDragOver} 
                         onDrop={handleDrop} 
@@ -513,7 +560,7 @@ const App: React.FC = () => {
                     {scannerMessages.length > 0 && (
                         <div className="space-y-2">
                             {scannerMessages.map((msg, index) => (
-                                <div key={index} className={`p-4 rounded-md text-sm border ${
+                                <div key={index} className={`p-4 rounded-md text-sm border break-words ${
                                     msg.type === 'success' ? 'bg-teal-900/50 text-teal-200 border-teal-500/30' :
                                     msg.type === 'error' ? 'bg-red-900/50 text-red-200 border-red-500/30' :
                                     'bg-yellow-900/50 text-yellow-200 border-yellow-500/30'
@@ -565,6 +612,10 @@ const App: React.FC = () => {
                     )}
                 </div>
             </main>
+            
+            <footer className="fixed bottom-4 right-4 text-xs text-slate-500 font-medium opacity-80 z-50">
+                &copy; IBRAHIM O.
+            </footer>
         </div>
     );
 };
