@@ -10,9 +10,13 @@ import { GoogleGenAI, Type } from "@google/genai";
 const DEFAULT_BACKEND_URL = ""; 
 
 // OPTION 2: Client Demo Mode (Easiest for testing)
-// Paste your API Key here. 
-// WARNING: This key is visible to anyone who views the source code.
-const HARDCODED_API_KEY = "AIzaSyBjA-yXiXD5TEsr7gejn5XT2mGgDs6WL48"; 
+// Paste your API Keys here. Add as many as you have to distribute the load.
+// WARNING: These keys are visible to anyone who views the source code.
+const HARDCODED_API_KEYS: string[] = [
+    "AIzaSyBhW3bPcjbgp9EHQBoRZHseWTwPc_fW1N0", 
+    "AIzaSyD9oGDnH8JoiI46x-5Nm6pk7ttBShripwc", 
+    "AIzaSyBvFZZ04KdxSp2brJGR3uOB2jz0rV4lKz0"
+]; 
 
 // --------------------------------
 
@@ -86,16 +90,13 @@ const App: React.FC = () => {
     const processReceipts = async () => {
         
         // 1. Setup API Access
-        let ai: GoogleGenAI | null = null;
-        const apiKey = HARDCODED_API_KEY || (import.meta as any).env?.VITE_API_KEY || process.env.API_KEY;
+        const envKey = (import.meta as any).env?.VITE_API_KEY || process.env.API_KEY;
+        const availableKeys = [...HARDCODED_API_KEYS, envKey].filter(k => k && k.trim().length > 0);
 
-        if (!useServerMode) {
-             if (!apiKey) {
-                 setScannerMessages([{ text: "Setup Error: No API Key configured in code. Please add HARDCODED_API_KEY in App.tsx.", type: 'error' }]);
-                 return;
-             }
-             ai = new GoogleGenAI({ apiKey: apiKey });
-        } else if (!DEFAULT_BACKEND_URL) {
+        if (!useServerMode && availableKeys.length === 0) {
+             setScannerMessages([{ text: "Setup Error: No API Keys configured. Please add keys to HARDCODED_API_KEYS in App.tsx.", type: 'error' }]);
+             return;
+        } else if (useServerMode && !DEFAULT_BACKEND_URL) {
              setScannerMessages([{ text: "Setup Error: Server Mode enabled but no URL configured.", type: 'error' }]);
              return;
         }
@@ -108,6 +109,7 @@ const App: React.FC = () => {
         const uniqueKeys = new Set<string>();
         const results: ScannerResult[] = [];
         let criticalErrorOccurred = false;
+        let attemptCounter = 0;
 
         // 2. Process Loop
         for (const file of selectedFiles) {
@@ -152,10 +154,35 @@ const App: React.FC = () => {
                         throw new Error(`Connection Failed: ${serverErr.message}.`);
                     }
 
-                } else if (ai) {
+                } else {
                     // --- CLIENT STRATEGY ---
                     const base64Data = await fileToBase64(file);
-                    fileResults = await callScannerGeminiAPI(ai, base64Data, mimeType);
+                    
+                    // Round-Robin Key Selection
+                    const currentKey = availableKeys[attemptCounter % availableKeys.length];
+                    attemptCounter++;
+                    const ai = new GoogleGenAI({ apiKey: currentKey });
+
+                    // Retry Logic for 429 Errors
+                    let retries = 3;
+                    while (retries > 0) {
+                        try {
+                            // Reduced delay due to key rotation - Increased to 5s for stability
+                            await new Promise(resolve => setTimeout(resolve, 5000));
+                            fileResults = await callScannerGeminiAPI(ai, base64Data, mimeType);
+                            break; // Success
+                        } catch (err: any) {
+                            const errMsg = err.message || "";
+                            if (errMsg.includes("429") || errMsg.includes("quota")) {
+                                retries--;
+                                if (retries === 0) throw err;
+                                setScannerMessages(prev => [...prev, { text: `Rate limit/Quota hit. Switching key & waiting 10s... (${file.name})`, type: 'warning' }]);
+                                await new Promise(resolve => setTimeout(resolve, 10000)); // Wait longer before retry
+                            } else {
+                                throw err; // Other errors, fail immediately
+                            }
+                        }
+                    }
                 }
                 
                 // 3. Merge Results
@@ -220,6 +247,12 @@ const App: React.FC = () => {
                 const date = new Date(item.paymentDate);
                 item.paymentDateDisplay = `${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()}`;
             }
+            if (item.receiptNumber) {
+                item.receiptNumber = String(item.receiptNumber).trim();
+            }
+            if (item.taxType) {
+                item.taxType = item.taxType.trim();
+            }
             return item;
         }) as ScannerResult[];
     };
@@ -232,8 +265,14 @@ const App: React.FC = () => {
         - paymentDate: The date the payment was made (ISO YYYY-MM-DD).
         - paymentPeriod: The month/year the payment covers (e.g., "Jan-25").
         - receiptNumber: The unique receipt or transaction number.
-        - taxType: The specific type of tax paid (e.g., "PAYE", "WHT").
-        - state: The State or Authority (e.g., "Lagos", "Delta", "Federal").
+            - CRITICAL FOR LAGOS STATE: Look for "Receipt No", "Transaction ID", "Payment Ref", "CBS Reference", or "Bill Reference". Capture the FULL alphanumeric string (e.g., "LGS...", "CBS...", "R-...", or numeric). Do not truncate. If it looks like a Lagos State receipt, prioritize the "CBS Reference" or "Payment Reference" if "Receipt No" is ambiguous.
+        - taxType: The specific type of tax paid.
+            - If it is "WVAT" or "Withholding VAT", return "WVAT".
+            - If it is generic "Withholding Tax" with no specific detail, return "WHT".
+            - If it is "Withholding Tax" with detail (e.g., Contract, Consultancy, Rent), return the full detail (e.g., "WHT on Contract").
+            - If "PAYE", return "PAYE".
+            - If "Development Levy", return "Development Levy".
+        - state: The State or Authority (e.g., "Lagos", "Delta", "Federal"). Normalize names (e.g., "Lagos State" -> "Lagos").
         - amount: The FINAL TOTAL amount paid.
         
         Return a valid JSON ARRAY of objects.`;
@@ -299,10 +338,15 @@ const App: React.FC = () => {
         const wb = XLSX.utils.book_new();
         const sortedResults = [...scannerResults].sort((a,b) => new Date(a.paymentDate).getTime() - new Date(b.paymentDate).getTime());
 
-        // Group by State first
+        // Group by State first, normalizing keys to avoid duplicates (e.g. Lagos vs LAGOS)
         const dataByState: { [key: string]: ScannerResult[] } = {};
         sortedResults.forEach(row => {
-            const stateKey = row.state ? row.state.trim() : "Unknown";
+            let stateKey = row.state ? row.state.trim().toUpperCase() : "UNKNOWN";
+            // Remove " STATE" suffix if present to group "Lagos" and "Lagos State"
+            stateKey = stateKey.replace(/\s+STATE$/i, "");
+            // Normalize common variations
+            if (stateKey === "FIRS" || stateKey === "FEDERAL GOVT" || stateKey === "FEDERAL INLAND REVENUE") stateKey = "FEDERAL";
+            
             if (!dataByState[stateKey]) dataByState[stateKey] = [];
             dataByState[stateKey].push(row);
         });
@@ -367,7 +411,7 @@ const App: React.FC = () => {
                      }
                 }
 
-                ws['!cols'] = [{ wch: 30 }, { wch: 15 }, { wch: 15 }, { wch: 25 }, { wch: 20 }];
+                ws['!cols'] = [{ wch: 30 }, { wch: 15 }, { wch: 15 }, { wch: 35 }, { wch: 20 }];
                 
                 // Sheet name limited to 31 chars
                 const sheetName = `Upload - ${state}`.substring(0, 31);
@@ -384,10 +428,27 @@ const App: React.FC = () => {
             const dataStyle = { border: thinBorder, font: { sz: 11 } };
             const titleStyle = { font: { bold: true, sz: 14 } };
 
-            const getYearFromPeriod = (period?: string) => {
-                if (!period) return "Unknown";
-                const match = period.match(/(\d{2,4})$/);
-                return match ? (match[1].length === 2 ? `20${match[1]}` : match[1]) : "Unknown";
+            // Robust year extractor that handles messy periods and falls back to payment date
+            const getYearFromPeriod = (period: string | undefined, paymentDate: string) => {
+                let p = period ? period.trim() : "";
+                
+                // 1. Try to find a 2-4 digit year at the end of the period string (e.g. "Jan-23", "2023")
+                const matchEnd = p.match(/(\d{2,4})$/);
+                if (matchEnd) {
+                    return matchEnd[1].length === 2 ? `20${matchEnd[1]}` : matchEnd[1];
+                }
+                
+                // 2. Try to find any 4 digit year in the string (e.g. "Jan 2023 Payment")
+                const matchAny = p.match(/(\d{4})/);
+                if (matchAny) return matchAny[1];
+
+                // 3. Fallback to Payment Date Year
+                if (paymentDate) {
+                    const d = new Date(paymentDate);
+                    if (!isNaN(d.getTime())) return d.getFullYear().toString();
+                }
+                
+                return "Unknown";
             };
 
             // Loop through each state
@@ -395,7 +456,7 @@ const App: React.FC = () => {
                  const dataByYear: { [key: string]: ScannerResult[] } = {};
 
                  stateRows.forEach(row => {
-                    const year = getYearFromPeriod(row.paymentPeriod);
+                    const year = getYearFromPeriod(row.paymentPeriod, row.paymentDate);
                     if (!dataByYear[year]) dataByYear[year] = [];
                     dataByYear[year].push(row);
                 });
@@ -410,7 +471,6 @@ const App: React.FC = () => {
                         return acc;
                     }, {} as Record<string, number>);
                     const titleName = Object.keys(companyCounts).reduce((a, b) => companyCounts[a] > companyCounts[b] ? a : b, "NASD PLC");
-                    const total = sheetData.reduce((sum, row) => sum + (row.amount || 0), 0);
                     
                     const ws = XLSX.utils.aoa_to_sheet([]);
                     
@@ -426,38 +486,96 @@ const App: React.FC = () => {
                     ['A4', 'B4', 'C4', 'D4', 'E4'].forEach(ref => {
                         if (ws[ref]) ws[ref].s = headerStyle;
                     });
-
-                    const dataRows = sheetData.map(row => [
-                        row.paymentDate ? new Date(row.paymentDate) : undefined,
-                        row.paymentPeriod,
-                        row.receiptNumber,
-                        row.taxType,
-                        row.amount
-                    ]);
                     
-                    XLSX.utils.sheet_add_aoa(ws, dataRows, { origin: "A5" });
+                    // --- NEW GROUPING LOGIC ---
+                    
+                    // 1. Group data by Tax Type
+                    const groups: Record<string, ScannerResult[]> = {};
+                    sheetData.forEach(r => {
+                        const key = r.taxType ? r.taxType.trim().toUpperCase() : "OTHER";
+                        if (!groups[key]) groups[key] = [];
+                        groups[key].push(r);
+                    });
+                    
+                    const sortedGroupKeys = Object.keys(groups).sort();
+                    
+                    let currentWriteRow = 4; // Start writing data from Row 5 (Index 4)
+                    
+                    sortedGroupKeys.forEach(groupKey => {
+                        const groupRows = groups[groupKey];
+                        // Sort rows within group by date
+                        groupRows.sort((a,b) => new Date(a.paymentDate).getTime() - new Date(b.paymentDate).getTime());
 
-                    const startRow = 4;
-                    dataRows.forEach((row, idx) => {
-                        const r = startRow + idx;
-                        const dateRef = XLSX.utils.encode_cell({c: 0, r});
-                        if (ws[dateRef]) {
-                            ws[dateRef].z = 'dd/mm/yyyy';
-                            ws[dateRef].s = { ...dataStyle, alignment: { horizontal: "center" } };
-                        }
-                        [1, 2, 3].forEach(c => {
-                            const ref = XLSX.utils.encode_cell({c, r});
-                            if(ws[ref]) ws[ref].s = dataStyle;
+                        // Add Section Header
+                        XLSX.utils.sheet_add_aoa(ws, [[groupKey]], { origin: { r: currentWriteRow, c: 0 } });
+                        
+                        // Merge header across
+                        if(!ws['!merges']) ws['!merges'] = [];
+                        ws['!merges'].push({ s: { r: currentWriteRow, c: 0 }, e: { r: currentWriteRow, c: 4 } });
+                        
+                        const shCell = XLSX.utils.encode_cell({r: currentWriteRow, c: 0});
+                        if(ws[shCell]) ws[shCell].s = { 
+                            font: { bold: true, sz: 11, color: { rgb: "FFFFFF" } }, 
+                            fill: { fgColor: { rgb: "6D28D9" } },
+                            alignment: { horizontal: "left" },
+                            border: thinBorder
+                        };
+                        
+                        currentWriteRow++; // Next row
+
+                        const rowsToAdd = groupRows.map(row => [
+                            row.paymentDate ? new Date(row.paymentDate) : undefined,
+                            row.paymentPeriod,
+                            row.receiptNumber,
+                            row.taxType,
+                            row.amount
+                        ]);
+
+                        XLSX.utils.sheet_add_aoa(ws, rowsToAdd, { origin: { r: currentWriteRow, c: 0 } });
+                        
+                        // Style Data Rows
+                        rowsToAdd.forEach((_, idx) => {
+                            const r = currentWriteRow + idx;
+                            const dateRef = XLSX.utils.encode_cell({c: 0, r});
+                            if (ws[dateRef]) {
+                                ws[dateRef].z = 'dd/mm/yyyy';
+                                ws[dateRef].s = { ...dataStyle, alignment: { horizontal: "center" } };
+                            }
+                            [1, 2, 3].forEach(c => {
+                                const ref = XLSX.utils.encode_cell({c, r});
+                                if(ws[ref]) ws[ref].s = dataStyle;
+                            });
+                            const amtRef = XLSX.utils.encode_cell({c: 4, r});
+                            if (ws[amtRef]) {
+                                ws[amtRef].z = '#,##0.00';
+                                ws[amtRef].s = dataStyle;
+                            }
                         });
-                        const amtRef = XLSX.utils.encode_cell({c: 4, r});
-                        if (ws[amtRef]) {
-                            ws[amtRef].z = '#,##0.00';
-                            ws[amtRef].s = dataStyle;
+                        
+                        currentWriteRow += rowsToAdd.length;
+                        
+                        // Optional Subtotal for Group
+                        const subTotal = groupRows.reduce((sum, r) => sum + (r.amount || 0), 0);
+                        // Add empty row then subtotal? No, just directly under or with 1 space? 
+                        // Let's put a subtotal line.
+                        XLSX.utils.sheet_add_aoa(ws, [["", "", "", "Subtotal", subTotal]], { origin: { r: currentWriteRow, c: 0 } });
+                        
+                        const subLabelRef = XLSX.utils.encode_cell({c: 3, r: currentWriteRow});
+                        const subValRef = XLSX.utils.encode_cell({c: 4, r: currentWriteRow});
+                        if(ws[subLabelRef]) ws[subLabelRef].s = { font: { italic: true, sz: 10 }, alignment: { horizontal: "right" } };
+                        if(ws[subValRef]) {
+                            ws[subValRef].z = '#,##0.00';
+                            ws[subValRef].s = { font: { italic: true, sz: 10 }, border: { top: { style: "thin" } } };
                         }
+                        
+                        currentWriteRow += 2; // Move past subtotal + 1 empty spacing row
                     });
 
-                    const totalRowIndex = startRow + dataRows.length + 1;
-                    XLSX.utils.sheet_add_aoa(ws, [["", "", "", "Total", total]], { origin: { r: totalRowIndex, c: 0 } });
+                    // Grand Total
+                    const total = sheetData.reduce((sum, row) => sum + (row.amount || 0), 0);
+                    const totalRowIndex = currentWriteRow;
+                    
+                    XLSX.utils.sheet_add_aoa(ws, [["", "", "", "GRAND TOTAL", total]], { origin: { r: totalRowIndex, c: 0 } });
                     
                     const totalLabelRef = XLSX.utils.encode_cell({c: 3, r: totalRowIndex});
                     const totalValRef = XLSX.utils.encode_cell({c: 4, r: totalRowIndex});
@@ -468,7 +586,7 @@ const App: React.FC = () => {
                         ws[totalValRef].s = { font: { bold: true }, border: { bottom: { style: "double" } } };
                     }
 
-                    ws['!cols'] = [{ wch: 15 }, { wch: 12 }, { wch: 30 }, { wch: 30 }, { wch: 20 }];
+                    ws['!cols'] = [{ wch: 15 }, { wch: 12 }, { wch: 35 }, { wch: 30 }, { wch: 20 }];
 
                     const sheetName = `${state} ${year}`.substring(0, 31);
                     XLSX.utils.book_append_sheet(wb, ws, sheetName);
