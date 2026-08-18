@@ -1,5 +1,5 @@
 {
-  "name": "REM & WHT analyzer",
-  "description": "An interactive, real-time code editor and previewer for HTML, CSS, and JavaScript. Paste your source code into the designated editors and instantly see the rendered output, making it easy to test snippets and prototype web ideas.",
+  "name": "Remittance Schedule Tool",
+  "description": "A client-side remittance receipt parser and Excel schedule exporter for PDF and image receipts.",
   "requestFramePermissions": []
 }

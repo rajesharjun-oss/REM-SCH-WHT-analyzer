@@ -2,11 +2,16 @@
 <img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Run and deploy your AI Studio app
+# Remittance Schedule Tool
 
-This contains everything you need to run your app locally.
+This app extracts remittance receipt data from PDFs and images without calling a cloud AI API. It uses browser-side PDF text extraction, bundled OCR for scanned receipts/images, and the existing Excel schedule exports.
 
-View your app in AI Studio: https://ai.studio/apps/5c9e07f1-77cd-418b-8b76-0954fe340907
+## Security Notes
+
+- No Gemini or other LLM API keys are required.
+- OCR worker, WASM core, and English traineddata are served from `public/ocr`.
+- Do not commit `.env.local` or any production credentials.
+- Review the generated schedule before filing or uploading it, especially when source files are scanned receipts.
 
 ## Run Locally
 
@@ -15,6 +20,7 @@ View your app in AI Studio: https://ai.studio/apps/5c9e07f1-77cd-418b-8b76-0954f
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+2. Run the app:
    `npm run dev`
+3. Build for deployment:
+   `npm run build`
