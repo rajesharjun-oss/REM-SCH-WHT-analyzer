@@ -211,6 +211,16 @@ const normalizePeriod = (rawValue: string, fallbackDate = '') => {
     return value;
 };
 
+const isNormalizedMonthPeriod = (value: string) => /^[A-Z][a-z]{2}-\d{2}$/.test(value);
+
+const normalizeSourceFilePeriod = (sourceFile: string, fallbackDate = '') => {
+    const fileStem = sourceFile.replace(/\.[^.]+$/, '');
+    const normalized = normalizePeriod(fileStem, fallbackDate);
+    return isNormalizedMonthPeriod(normalized) ? normalized : '';
+};
+
+const isUnusablePaymentPeriod = (value: string) => !value || /^(?:covered|period|month|year)$/i.test(cleanValue(value));
+
 const parseAmount = (rawValue: string) => {
     const value = cleanValue(rawValue).replace(/[,\s]/g, '');
     const match = value.match(/-?\d+(?:\.\d{1,2})?/);
@@ -279,16 +289,32 @@ const cleanReceiptNumberCandidate = (rawValue: string) =>
         .replace(/[:\s._#=-]+$/, '')
         .replace(/\s+/g, '');
 
+const cleanRrrCandidate = (rawValue: string) => {
+    const digits = cleanValue(rawValue).replace(/\D/g, '');
+    if (digits.length === 12) {
+        return `${digits.slice(0, 4)}-${digits.slice(4, 8)}-${digits.slice(8)}`;
+    }
+    return cleanReceiptNumberCandidate(rawValue);
+};
+
+type ReceiptPattern = {
+    regex: RegExp;
+    cleaner?: (rawValue: string) => string;
+    allowForLagos?: boolean;
+    allowForPaydirect?: boolean;
+};
+
 const findReceiptPattern = (
     text: string,
-    patterns: { regex: RegExp; allowForLagos?: boolean }[],
-    isLagosReceipt: boolean
+    patterns: ReceiptPattern[],
+    context: { isLagosReceipt: boolean; isPaydirectReceipt: boolean }
 ) => {
-    for (const { regex, allowForLagos = true } of patterns) {
-        if (isLagosReceipt && !allowForLagos) continue;
+    for (const { regex, cleaner = cleanReceiptNumberCandidate, allowForLagos = true, allowForPaydirect = true } of patterns) {
+        if (context.isLagosReceipt && !allowForLagos) continue;
+        if (context.isPaydirectReceipt && !allowForPaydirect) continue;
         const match = text.match(regex);
         if (!match?.[1]) continue;
-        const candidate = cleanReceiptNumberCandidate(match[1]);
+        const candidate = cleaner(match[1]);
         if (isValidReceiptNumber(candidate)) return candidate;
     }
 
@@ -320,30 +346,43 @@ const extractCompanyName = (text: string) => {
 };
 
 const extractReceiptNumber = (text: string, stateHint = '') => {
-    const isLagosReceipt = /\blagos\b/i.test(`${stateHint}\n${text}`);
-    const lagosReceiptMatch = text.match(/^\s*(\d{6,10}\/[A-Z0-9]{6,})\b/im);
-    if (lagosReceiptMatch) {
-        const candidate = cleanValue(lagosReceiptMatch[1]);
-        if (isValidReceiptNumber(candidate)) return candidate;
-    }
+    const receiptContextText = `${stateHint}\n${text}`;
+    const context = {
+        isLagosReceipt: /\blagos\b/i.test(receiptContextText),
+        isPaydirectReceipt: /\bpay\s*direct|paydirect|paydirect[_\s-]*new|edo[_\s-]*state[_\s-]*paydirect/i.test(receiptContextText)
+    };
 
-    const stateSpecificPatterns = [
+    const highestPriorityPatterns: ReceiptPattern[] = [
+        { regex: /^\s*(\d{6,10}\/[A-Z0-9]{6,})\b/im },
+        {
+            regex: /(?:Remita\s+Retrieval\s+Reference(?:\s*\(?RRR\)?)?|RRR)\s*[:#=-]*\s*(\d{4}[-\s]?\d{4}[-\s]?\d{4}|\d{12})/i,
+            cleaner: cleanRrrCandidate
+        },
+        { regex: /(?:^|\n)\s*(?:Official\s+)?(?:e-?\s*)?Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
+        { regex: /(?:^|\n)\s*Receipt\s*[:#=-]\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
+        { regex: /(?:^|\n)\s*(?:Payment|Tax)\s+Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im }
+    ];
+    const highestPriorityReceiptNumber = findReceiptPattern(text, highestPriorityPatterns, context);
+    if (highestPriorityReceiptNumber) return highestPriorityReceiptNumber;
+
+    if (context.isPaydirectReceipt) return '';
+
+    const stateSpecificPatterns: ReceiptPattern[] = [
         { regex: /(?:CBS\s*(?:Ref|Reference|No\.?|Number)?\s*[:#=-]*\s*)([A-Z0-9][A-Z0-9/_-]{5,30})/i },
-        { regex: /(?:Payment\s*(?:Ref|Reference|No\.?|Number|ID|Code)\s*[:#=-]*\s*)([A-Z0-9][A-Z0-9/_-]{5,30})/i },
+        { regex: /(?:Payment\s*(?:Ref\.?|Reference|No\.?|Number|ID|Code)\s*[:#=-]*\s*)([A-Z0-9][A-Z0-9/_-]{5,30})/i, allowForPaydirect: false },
         { regex: /(?:Bill\s*(?:Ref|Reference|No\.?|Number)\s*[:#=-]*\s*)([A-Z0-9][A-Z0-9/_-]{5,30})/i },
-        { regex: /\b(?:LGS|LIRS)[-_]?(?:REC|PAY)?[-_]?([A-Z0-9][A-Z0-9/_-]{5,24})\b/i },
-        { regex: /(?:RRR|Remita\s*Retrieval\s*Reference)\s*[:#=-]*\s*(\d{4}[-\s]?\d{4}[-\s]?\d{4}|\d{12})/i },
+        { regex: /\b((?:LGS|LIRS|LASG|CBS)[-_]?(?:REC|PAY|REF)?[-_]?[A-Z0-9][A-Z0-9/_-]{5,30})\b/i },
         { regex: /(?:TaxPro\s*Max|Document\s*No\.?|Doc\s*No\.?)\s*[:#=-]*\s*([A-Z0-9][A-Z0-9/_-]{5,30})/i },
+        { regex: /(?:PRN|Payment\s*Registration\s*Number|Payment\s*Reference\s*Number)\s*[:#=-]*\s*([A-Z0-9][A-Z0-9/_-]{5,30})/i },
         { regex: /(?:FIRS|Assessment)\s*(?:No\.?|Number|Receipt\s*No\.?)\s*[:#=-]*\s*([A-Z0-9][A-Z0-9/_-]{5,30})/i, allowForLagos: false },
-        { regex: /\b(?:EIRS|RIRS|OGSG|DBIR|KADIRS|KDIRS|BIRS)[-_]?(?:REC|REF)?[-_]?([A-Z0-9][A-Z0-9/_-]{5,24})\b/i },
-        { regex: /(?:Assessment\s*(?:Ref|Reference|No\.?|Number)?\s*[:#=-]*)([A-Z0-9][A-Z0-9/_-]{5,30})/i, allowForLagos: false },
+        { regex: /\b((?:EIRS|EDSG|RIRS|RIVIRS|OGIRS|OGSG|DBIR|DIRS|KADIRS|KDIRS|BIRS|BIR|KGIRS|KWIRS|OIRS|ODIRS|OYIRS|PSIRS|JGIRS|NIRS|NSIRS|BSIRS|AKIRS|AIRS|ABIRS|ANIRS|ESIRS|KTSIRS|YIRS|ZIRS)[-_]?(?:REC|RCPT|REF|PAY|TXN)?[-_]?[A-Z0-9][A-Z0-9/_-]{5,30})\b/i },
         { regex: /(?:Agency\s*Ref|Tracking\s*(?:Ref|ID|No\.?))\s*[:#=-]*\s*([A-Z0-9][A-Z0-9/_-]{5,30})/i }
     ];
 
-    const stateSpecificReceiptNumber = findReceiptPattern(text, stateSpecificPatterns, isLagosReceipt);
+    const stateSpecificReceiptNumber = findReceiptPattern(text, stateSpecificPatterns, context);
     if (stateSpecificReceiptNumber) return stateSpecificReceiptNumber;
 
-    const genericPatterns = [
+    const genericPatterns: ReceiptPattern[] = [
         { regex: /(?:Receipt\s*(?:No\.?|Number|#|ID)?\s*[:#=-]*\s*)([A-Z0-9][A-Z0-9/_-]{4,30})/i },
         { regex: /(?:Transaction\s*(?:ID|Ref|Reference|No\.?|#)?\s*[:#=-]*\s*)([A-Z0-9][A-Z0-9/_-]{5,35})/i },
         { regex: /(?:e-?Receipt|Slip\s*(?:No\.?|Number)?\s*[:#=-]*\s*)([A-Z0-9][A-Z0-9/_-]{4,30})/i },
@@ -351,10 +390,17 @@ const extractReceiptNumber = (text: string, stateHint = '') => {
         { regex: /(?:Ref(?:erence)?\s*(?:No\.?|Number|#)?\s*[:#=-]*\s*)([A-Z0-9][A-Z0-9/_-]{5,30})/i }
     ];
 
-    const genericReceiptNumber = findReceiptPattern(text, genericPatterns, isLagosReceipt);
+    const genericReceiptNumber = findReceiptPattern(text, genericPatterns, context);
     if (genericReceiptNumber) return genericReceiptNumber;
 
-    const standalone = text.match(/\b(?:LGS|CBS|FIRS|R-|RRR)[A-Z0-9\-/]{5,}\b/i);
+    const lowConfidenceFallbackPatterns: ReceiptPattern[] = [
+        { regex: /(?:Assessment\s*(?:Ref|Reference|No\.?|Number)?\s*[:#=-]*)([A-Z0-9][A-Z0-9/_-]{5,30})/i, allowForLagos: false, allowForPaydirect: false },
+        { regex: /\b((?:LGS|CBS|FIRS|TPM|PRN|RRR|EIRS|EDSG|RIRS|OGIRS|OGSG|DBIR|KADIRS|KDIRS|BIRS|R-)[A-Z0-9\-/]{5,35})\b/i, allowForPaydirect: false }
+    ];
+    const fallbackReceiptNumber = findReceiptPattern(text, lowConfidenceFallbackPatterns, context);
+    if (fallbackReceiptNumber) return fallbackReceiptNumber;
+
+    const standalone = text.match(/\b(?:LGS|CBS|FIRS|TPM|PRN|RRR|EIRS|EDSG|RIRS|OGIRS|OGSG|DBIR|KADIRS|KDIRS|BIRS|R-)[A-Z0-9\-/]{5,}\b/i);
     return standalone ? cleanValue(standalone[0]) : '';
 };
 
@@ -378,6 +424,35 @@ const extractPaymentDate = (text: string) => {
     }
 
     return '';
+};
+
+const extractPaymentPeriod = (text: string) => {
+    const periodValuePattern =
+        /((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\w*[-\s,/]*(?:20\d{2}|\d{2})(?:\s*\[[^\]]+\])?|\d{1,2}[-/.](?:20\d{2}|\d{2})|20\d{2})/i;
+
+    const directPatterns = [
+        new RegExp(`(?:Period\\s*Covered|Covered\\s*Period|Payment\\s*Period|Tax\\s*Period|Assessment\\s*Period|Revenue\\s*Period)\\s*[:#=-]?\\s*${periodValuePattern.source}`, 'i'),
+        new RegExp(`(?:For\\s*the\\s*Month|Month\\s*of|Tax\\s*Month)\\s*[:#=-]?\\s*${periodValuePattern.source}`, 'i')
+    ];
+
+    for (const pattern of directPatterns) {
+        const match = text.match(pattern);
+        if (match?.[1]) return cleanValue(match[1]);
+    }
+
+    const labelled = findLabelValue(text, [
+        'Period Covered',
+        'Covered Period',
+        'Payment Period',
+        'Tax Period',
+        'Period of Payment',
+        'Assessment Period',
+        'Revenue Period',
+        'Month'
+    ]);
+
+    const cleanedLabelled = cleanValue(labelled).replace(/^covered\b\s*[:#=-]?\s*/i, '');
+    return isUnusablePaymentPeriod(cleanedLabelled) ? '' : cleanedLabelled;
 };
 
 const extractTaxType = (text: string) => {
@@ -416,12 +491,17 @@ const normalizeState = (rawValue: string, fullText = '') => {
     const value = cleanValue(rawValue);
     const combined = `${value}\n${fullText}`;
 
+    if (/\b(?:fct|fctirs|federal\s+capital\s+territory|abuja\s+internal\s+revenue)\b/i.test(combined)) {
+        return 'FCT';
+    }
+
     if (/\b(?:firs|federal\s+inland\s+revenue|federal\s+govt|federal government)\b/i.test(combined)) {
         return 'Federal';
     }
 
     for (const state of nigerianStates) {
-        const pattern = new RegExp(`\\b${escapeRegExp(state)}(?:\\s+state)?\\b`, 'i');
+        const statePattern = escapeRegExp(state).replace(/\\ /g, '[\\s_-]+');
+        const pattern = new RegExp(`(?:^|[^A-Za-z0-9])${statePattern}(?:[\\s_-]+state)?(?=$|[^A-Za-z0-9])`, 'i');
         if (pattern.test(combined)) {
             return state === 'FCT' ? 'FCT' : state;
         }
@@ -469,7 +549,12 @@ const extractAmount = (text: string) => {
 
 const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string): ScannerResult => {
     const paymentDate = parseDateToIso(raw.paymentDate ?? '') || cleanValue(raw.paymentDate);
-    const paymentPeriod = normalizePeriod(raw.paymentPeriod ?? '', paymentDate);
+    const extractedPaymentPeriod = normalizePeriod(raw.paymentPeriod ?? '', paymentDate);
+    const sourceFilePeriod = normalizeSourceFilePeriod(sourceFile, paymentDate);
+    const paymentPeriod =
+        (/^\d{4}$/.test(extractedPaymentPeriod) || isUnusablePaymentPeriod(extractedPaymentPeriod)) && sourceFilePeriod
+            ? sourceFilePeriod
+            : extractedPaymentPeriod;
     const amount =
         typeof raw.amount === 'number'
             ? raw.amount
@@ -488,13 +573,33 @@ const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string): Scann
     };
 };
 
+const isReceiptStartChunk = (text: string) =>
+    /^\s*\d{6,10}\/[A-Z0-9]{6,}\b/im.test(text) ||
+    /\b(?:Remita\s+Retrieval\s+Reference|RRR|Receipt\s*(?:No\.?|Number|#|ID)|Payment\s+Date|Date\s+of\s+Payment|Total\s+Amount\s+Paid|Customer\s+Name|Taxpayer\s+Name|Payer\s+Name|Payment\s+Ref\.?\s*Number|CBS\s*Reference)\b/i.test(text);
+
+const groupReceiptChunks = (chunks: string[]) => {
+    if (chunks.length <= 1) return chunks;
+
+    const grouped: string[] = [];
+    for (const chunk of chunks) {
+        if (grouped.length === 0 || isReceiptStartChunk(chunk)) {
+            grouped.push(chunk);
+            continue;
+        }
+
+        grouped[grouped.length - 1] = `${grouped[grouped.length - 1]}\n${chunk}`;
+    }
+
+    return grouped;
+};
+
 const parseReceiptText = (text: string, sourceFile: string): ScannerResult[] => {
     const normalizedText = normalizeWhitespace(text);
     const pageChunks = normalizedText
         .split(/\n\s*\f\s*\n/g)
         .map(chunk => chunk.trim())
         .filter(chunk => chunk.length > 30);
-    const candidates = pageChunks.length ? pageChunks : [normalizedText];
+    const candidates = pageChunks.length ? groupReceiptChunks(pageChunks) : [normalizedText];
 
     return candidates.map(candidate => {
         const state = extractState(candidate);
@@ -503,14 +608,7 @@ const parseReceiptText = (text: string, sourceFile: string): ScannerResult[] => 
             {
                 companyName: extractCompanyName(candidate),
                 paymentDate: extractPaymentDate(candidate),
-                paymentPeriod: findLabelValue(candidate, [
-                    'Payment Period',
-                    'Tax Period',
-                    'Period of Payment',
-                    'Assessment Period',
-                    'Period',
-                    'Month'
-                ]),
+                paymentPeriod: extractPaymentPeriod(candidate),
                 receiptNumber: extractReceiptNumber(candidate, state),
                 taxType: extractTaxType(candidate),
                 amount: extractAmount(candidate),
