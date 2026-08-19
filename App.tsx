@@ -155,7 +155,7 @@ const parseDateToIso = (rawValue: string) => {
     }
 
     const namedDayFirst = value.match(
-        /\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})[,]?\s+(\d{2,4})\b/i
+        /\b(\d{1,2})(?:st|nd|rd|th)?[-\s/]+([A-Za-z]{3,9})[-\s,/]+(\d{2,4})\b/i
     );
     if (namedDayFirst) {
         const monthIndex = monthLookup[namedDayFirst[2].toLowerCase()];
@@ -165,7 +165,7 @@ const parseDateToIso = (rawValue: string) => {
     }
 
     const namedMonthFirst = value.match(
-        /\b([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(\d{2,4})\b/i
+        /\b([A-Za-z]{3,9})[-\s/]+(\d{1,2})(?:st|nd|rd|th)?[-\s,/]+(\d{2,4})\b/i
     );
     if (namedMonthFirst) {
         const monthIndex = monthLookup[namedMonthFirst[1].toLowerCase()];
@@ -188,6 +188,12 @@ const derivePreviousPeriod = (isoDate: string) => {
 const normalizePeriod = (rawValue: string, fallbackDate = '') => {
     const value = cleanValue(rawValue);
     if (!value) return derivePreviousPeriod(fallbackDate);
+
+    const dateLikePeriod = parseDateToIso(value);
+    if (dateLikePeriod) {
+        const [, year, month] = dateLikePeriod.match(/^(\d{4})-(\d{2})-\d{2}$/) ?? [];
+        if (year && month) return `${monthShortNames[Number(month) - 1]}-${year.slice(-2)}`;
+    }
 
     const monthYear = value.match(
         /\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\w*[-\s,/]*(\d{2,4})\b/i
@@ -216,7 +222,20 @@ const isNormalizedMonthPeriod = (value: string) => /^[A-Z][a-z]{2}-\d{2}$/.test(
 const normalizeSourceFilePeriod = (sourceFile: string, fallbackDate = '') => {
     const fileStem = sourceFile.replace(/\.[^.]+$/, '');
     const normalized = normalizePeriod(fileStem, fallbackDate);
-    return isNormalizedMonthPeriod(normalized) ? normalized : '';
+    if (isNormalizedMonthPeriod(normalized)) return normalized;
+
+    const monthOnly = fileStem.match(
+        /\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b/i
+    );
+    const dateMatch = fallbackDate.match(/^(\d{4})-(\d{2})-\d{2}$/);
+    if (monthOnly && dateMatch) {
+        const sourceMonthIndex = monthLookup[monthOnly[1].toLowerCase()];
+        const paymentMonthIndex = Number(dateMatch[2]) - 1;
+        const inferredYear = Number(dateMatch[1]) - (sourceMonthIndex > paymentMonthIndex ? 1 : 0);
+        return `${monthShortNames[sourceMonthIndex]}-${String(inferredYear).slice(-2)}`;
+    }
+
+    return '';
 };
 
 const isUnusablePaymentPeriod = (value: string) => !value || /^(?:covered|period|month|year)$/i.test(cleanValue(value));
@@ -274,19 +293,20 @@ const isValidReceiptNumber = (rawValue: string) => {
     if (!value) return false;
     if (nigerianStates.some(state => state.toLowerCase() === value.toLowerCase())) return false;
     if (/^(?:federal|unknown|receipt|payment|transaction|lagos|successful|completed|pending|approved|original|customer)$/i.test(value)) return false;
+    if (/[.]/.test(value) || /\b(?:https?|www|view|details|json|receiptprint|login|aboutblank)\b/i.test(value)) return false;
     if (/^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$/.test(value) || /^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$/.test(value)) return false;
 
     const hasDigit = /\d/.test(value);
-    const hasKnownPrefix = /^(?:LGS|LIRS|LASG|CBS|FIRS|RRR|R-|PAY|TXN|PRN|TPM|E-TAX|ETAX|EIRS|RIRS|OGSG|DBIR|KADIRS|KDIRS|BIRS)/i.test(value);
+    const hasKnownPrefix = /^(?:LGS|LIRS|LASG|CBS|FIRS|RRR|R-|PAY|TXN|PRN|KRN|TPM|E-TAX|ETAX|EIRS|EDSG|RIRS|RIVIRS|OGIRS|OGSG|DBIR|DIRS|KADIRS|KDIRS|BIRS|BIR|KGIRS|KWIRS|OIRS|ODIRS|OYIRS|PSIRS|JGIRS|NIRS|NSIRS|BSIRS|AKIRS|AIRS|ABIRS|ANIRS|ESIRS|KTSIRS|YIRS|ZIRS)/i.test(value);
     const looksReferenceLike = /^[A-Z0-9][A-Z0-9/_-]{5,}$/i.test(value);
 
-    return hasKnownPrefix || (hasDigit && looksReferenceLike);
+    return hasDigit && (hasKnownPrefix || looksReferenceLike);
 };
 
 const cleanReceiptNumberCandidate = (rawValue: string) =>
     cleanValue(rawValue)
-        .replace(/^[:\s._#=-]+/, '')
-        .replace(/[:\s._#=-]+$/, '')
+        .replace(/^[/\\:\s._#=-]+/, '')
+        .replace(/[/\\:\s._#=-]+$/, '')
         .replace(/\s+/g, '');
 
 const cleanRrrCandidate = (rawValue: string) => {
@@ -295,6 +315,21 @@ const cleanRrrCandidate = (rawValue: string) => {
         return `${digits.slice(0, 4)}-${digits.slice(4, 8)}-${digits.slice(8)}`;
     }
     return cleanReceiptNumberCandidate(rawValue);
+};
+
+const hasRemitaRrrLabel = (text: string) =>
+    /\bRemita\s+Retrieval\s+Reference\b/i.test(text) ||
+    (/\bRemita\s+Retrieval\b/i.test(text) && /\bReference\s*\(?RRR\)?\b/i.test(text)) ||
+    /(?:^|\n)\s*RRR\b/i.test(text);
+
+const extractRemitaRrr = (text: string) => {
+    if (!hasRemitaRrrLabel(text)) return '';
+
+    const rrrNumber = text.match(/\b(\d{4}[-\s]?\d{4}[-\s]?\d{4}|\d{12})\b/);
+    if (!rrrNumber?.[1]) return '';
+
+    const candidate = cleanRrrCandidate(rrrNumber[1]);
+    return isValidReceiptNumber(candidate) ? candidate : '';
 };
 
 type ReceiptPattern = {
@@ -360,10 +395,16 @@ const extractReceiptNumber = (text: string, stateHint = '') => {
         },
         { regex: /(?:^|\n)\s*(?:Official\s+)?(?:e-?\s*)?Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
         { regex: /(?:^|\n)\s*Receipt\s*[:#=-]\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
-        { regex: /(?:^|\n)\s*(?:Payment|Tax)\s+Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im }
+        { regex: /(?:^|\n)\s*(?:Payment|Tax)\s+Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
+        { regex: /(?:^|\n)\s*KRN\s*[:#=-]?\s*(\d{12})/im, cleaner: cleanRrrCandidate, allowForPaydirect: false },
+        { regex: /(?:Session\s*ID)\s*[:#=-]?\s*([0-9]{10,40})/i, allowForPaydirect: false },
+        { regex: /(?:Invoice\s*No\.?|Invoice\s*Number|Invoicenumber)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{5,30})/i, allowForPaydirect: false }
     ];
     const highestPriorityReceiptNumber = findReceiptPattern(text, highestPriorityPatterns, context);
     if (highestPriorityReceiptNumber) return highestPriorityReceiptNumber;
+
+    const remitaRrr = extractRemitaRrr(text);
+    if (remitaRrr) return remitaRrr;
 
     if (context.isPaydirectReceipt) return '';
 
@@ -401,7 +442,8 @@ const extractReceiptNumber = (text: string, stateHint = '') => {
     if (fallbackReceiptNumber) return fallbackReceiptNumber;
 
     const standalone = text.match(/\b(?:LGS|CBS|FIRS|TPM|PRN|RRR|EIRS|EDSG|RIRS|OGIRS|OGSG|DBIR|KADIRS|KDIRS|BIRS|R-)[A-Z0-9\-/]{5,}\b/i);
-    return standalone ? cleanValue(standalone[0]) : '';
+    const standaloneCandidate = standalone ? cleanReceiptNumberCandidate(standalone[0]) : '';
+    return isValidReceiptNumber(standaloneCandidate) ? standaloneCandidate : '';
 };
 
 const extractPaymentDate = (text: string) => {
@@ -428,7 +470,7 @@ const extractPaymentDate = (text: string) => {
 
 const extractPaymentPeriod = (text: string) => {
     const periodValuePattern =
-        /((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\w*[-\s,/]*(?:20\d{2}|\d{2})(?:\s*\[[^\]]+\])?|\d{1,2}[-/.](?:20\d{2}|\d{2})|20\d{2})/i;
+        /(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\w*[-\s,/]*(?:20\d{2}|\d{2})(?:\s*\[[^\]]+\])?|\d{1,2}[-/.](?:20\d{2}|\d{2})|20\d{2})/i;
 
     const directPatterns = [
         new RegExp(`(?:Period\\s*Covered|Covered\\s*Period|Payment\\s*Period|Tax\\s*Period|Assessment\\s*Period|Revenue\\s*Period)\\s*[:#=-]?\\s*${periodValuePattern.source}`, 'i'),
@@ -468,7 +510,7 @@ const extractTaxType = (text: string) => {
 
     const searchArea = `${labelled}\n${text}`;
     if (/\b(?:withholding\s+vat|wvat)\b/i.test(searchArea)) return 'WVAT';
-    if (/\b(?:pay\s+as\s+you\s+earn|paye)\b/i.test(searchArea)) return 'PAYE';
+    if (/\b(?:pay[-\s]*as[-\s]*you[-\s]*earn|paye)\b/i.test(searchArea)) return 'PAYE';
     if (/\bdevelopment\s+levy\b/i.test(searchArea)) return 'Development Levy';
 
     const whtLine = searchArea
@@ -483,20 +525,41 @@ const extractTaxType = (text: string) => {
     }
 
     if (/\bvat\b/i.test(searchArea)) return 'VAT';
+    if (searchArea.split('\n').some(line => /^taxes?$/i.test(cleanValue(line)))) return 'Tax';
     if (labelled) return labelled;
     return '';
+};
+
+const normalizeTaxTypeForSource = (rawValue: string, sourceFile: string) => {
+    const value = cleanValue(rawValue);
+    const source = sourceFile.replace(/[_-]+/g, ' ');
+
+    if (/\b(?:dev(?:elopment)?\s+levy)\b/i.test(source)) return 'Development Levy';
+    if ((value === '' || /^vat$/i.test(value) || /^igr tax$/i.test(value)) && /\bpaye\b/i.test(source)) return 'PAYE';
+    if (!value && /\bwvat\b/i.test(source)) return 'WVAT';
+    if (!value && /\bwht\b/i.test(source)) return 'WHT';
+
+    return value;
 };
 
 const normalizeState = (rawValue: string, fullText = '') => {
     const value = cleanValue(rawValue);
     const combined = `${value}\n${fullText}`;
 
-    if (/\b(?:fct|fctirs|federal\s+capital\s+territory|abuja\s+internal\s+revenue)\b/i.test(combined)) {
+    if (/\b(?:fct|fctirs|fstirs|federal\s+capital\s+territory|abuja\s+internal\s+revenue)\b/i.test(combined)) {
         return 'FCT';
     }
 
     if (/\b(?:firs|federal\s+inland\s+revenue|federal\s+govt|federal government)\b/i.test(combined)) {
         return 'Federal';
+    }
+
+    if (/\b(?:cross\s*river|crossrivers?|cirs|crirs)\b/i.test(combined)) {
+        return 'Cross River';
+    }
+
+    if (/\b(?:kirs|kano\s+internal\s+revenue|kano\s+state\s+electronic\s+revenue|kano\s+state\s+revenue)\b/i.test(combined)) {
+        return 'Kano';
     }
 
     for (const state of nigerianStates) {
@@ -522,6 +585,34 @@ const extractState = (text: string) => {
 };
 
 const extractAmount = (text: string) => {
+    const amountNumberPattern = /([0-9]{1,3}(?:,[0-9]{3})+(?:\.\d{1,2})?|[0-9]{4,}(?:\.\d{1,2})?)/;
+    const collectAmounts = (pattern: RegExp) => {
+        const amounts: number[] = [];
+        pattern.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = pattern.exec(text)) !== null) {
+            const rawAmount = match[1];
+            const compactAmount = cleanValue(rawAmount).replace(/[,\s]/g, '');
+            if (!/[,.]/.test(rawAmount) && /^\d{8,}$/.test(compactAmount)) {
+                if (match.index === pattern.lastIndex) pattern.lastIndex += 1;
+                continue;
+            }
+            const amount = parseAmount(rawAmount);
+            if (amount !== null) amounts.push(amount);
+            if (match.index === pattern.lastIndex) pattern.lastIndex += 1;
+        }
+        return amounts;
+    };
+    const labelledAmountPatterns = [
+        new RegExp(`(?:Total\\s+Amount\\s+Paid|Grand\\s+Total|Amount\\s*To\\s*Pay|Amount\\s+Paid|Payment\\s+Amount|Total)\\s*(?:\\([^)]*\\))?\\s*[:#=-]?[\\s\\S]{0,50}?${amountNumberPattern.source}`, 'gi'),
+        new RegExp(`\\bAmount\\s*(?:\\([^)]*\\))?\\s*[:#=-]?[\\s\\S]{0,80}?${amountNumberPattern.source}`, 'gi')
+    ];
+
+    const labelledCandidates = labelledAmountPatterns
+        .flatMap(pattern => collectAmounts(pattern))
+        .filter(amount => amount > 0);
+    if (labelledCandidates.length) return Math.max(...labelledCandidates);
+
     const labelled = findLabelValue(text, [
         'Total Amount Paid',
         'Total Amount',
@@ -533,14 +624,10 @@ const extractAmount = (text: string) => {
     const labelledAmount = parseAmount(labelled);
     if (labelledAmount !== null) return labelledAmount;
 
-    const matches = [...text.matchAll(/(?:NGN|N|NGN\.|N\.|=)\s*([0-9][0-9,]*(?:\.\d{1,2})?)/gi)]
-        .map(match => parseAmount(match[1]))
-        .filter((amount): amount is number => amount !== null);
+    const matches = collectAmounts(/(?:NGN\.?|₦|=N=|=|\bN\.?\b)\s*([0-9][0-9,]*(?:\.\d{1,2})?)/gi);
 
     if (matches.length === 0) {
-        const plainAmounts = [...text.matchAll(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.\d{1,2})?)\b/g)]
-            .map(match => parseAmount(match[1]))
-            .filter((amount): amount is number => amount !== null);
+        const plainAmounts = collectAmounts(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.\d{1,2})?)\b/g);
         return plainAmounts.length ? Math.max(...plainAmounts) : 0;
     }
 
@@ -566,16 +653,22 @@ const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string): Scann
         paymentDateDisplay: formatDateDisplay(paymentDate),
         paymentPeriod,
         receiptNumber: cleanValue(raw.receiptNumber),
-        taxType: cleanValue(raw.taxType),
+        taxType: normalizeTaxTypeForSource(raw.taxType ?? '', sourceFile),
         amount,
-        state: normalizeState(raw.state ?? ''),
+        state: normalizeState(raw.state ?? '', sourceFile),
         sourceFile
     };
 };
 
-const isReceiptStartChunk = (text: string) =>
-    /^\s*\d{6,10}\/[A-Z0-9]{6,}\b/im.test(text) ||
-    /\b(?:Remita\s+Retrieval\s+Reference|RRR|Receipt\s*(?:No\.?|Number|#|ID)|Payment\s+Date|Date\s+of\s+Payment|Total\s+Amount\s+Paid|Customer\s+Name|Taxpayer\s+Name|Payer\s+Name|Payment\s+Ref\.?\s*Number|CBS\s*Reference)\b/i.test(text);
+const isReceiptStartChunk = (text: string) => {
+    const hasLagosTopReference = /^\s*\d{6,10}\/[A-Z0-9]{6,}\b/im.test(text);
+    const hasRemitaReference = hasRemitaRrrLabel(text);
+    const hasStrongReceiptDetails =
+        /\b(?:Payment\s+Date|Date\s+of\s+Payment|Total\s+Amount\s+Paid|Customer\s+Name|Taxpayer\s+Name|Payer\s+Name|Payment\s+Ref\.?\s*Number|CBS\s*Reference)\b/i.test(text);
+    const hasReceiptNumberLabel = /\bReceipt\s*(?:No\.?|Number|#|ID)\b/i.test(text);
+
+    return hasLagosTopReference || hasRemitaReference || hasStrongReceiptDetails || hasReceiptNumberLabel;
+};
 
 const groupReceiptChunks = (chunks: string[]) => {
     if (chunks.length <= 1) return chunks;
