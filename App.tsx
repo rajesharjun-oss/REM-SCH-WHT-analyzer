@@ -542,6 +542,17 @@ const normalizeTaxTypeForSource = (rawValue: string, sourceFile: string) => {
     return value;
 };
 
+const inferStateFromTaxContext = (taxType: string, receiptNumber: string) => {
+    const normalizedTaxType = cleanValue(taxType);
+    const normalizedReceiptNumber = cleanReceiptNumberCandidate(receiptNumber);
+
+    if (/^W(?:HT|VAT)\b/i.test(normalizedTaxType) && /^\d{12}$/.test(normalizedReceiptNumber)) {
+        return 'Federal';
+    }
+
+    return '';
+};
+
 const normalizeState = (rawValue: string, fullText = '') => {
     const value = cleanValue(rawValue);
     const combined = `${value}\n${fullText}`;
@@ -646,16 +657,19 @@ const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string): Scann
         typeof raw.amount === 'number'
             ? raw.amount
             : parseAmount(String(raw.amount ?? '')) ?? 0;
+    const receiptNumber = cleanValue(raw.receiptNumber);
+    const taxType = normalizeTaxTypeForSource(raw.taxType ?? '', sourceFile);
+    const state = normalizeState(raw.state ?? '', sourceFile) || inferStateFromTaxContext(taxType, receiptNumber);
 
     return {
         companyName: normalizeCompanyName(raw.companyName ?? ''),
         paymentDate,
         paymentDateDisplay: formatDateDisplay(paymentDate),
         paymentPeriod,
-        receiptNumber: cleanValue(raw.receiptNumber),
-        taxType: normalizeTaxTypeForSource(raw.taxType ?? '', sourceFile),
+        receiptNumber,
+        taxType,
         amount,
-        state: normalizeState(raw.state ?? '', sourceFile),
+        state,
         sourceFile
     };
 };
