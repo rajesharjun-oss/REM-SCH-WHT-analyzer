@@ -8,6 +8,8 @@ This app extracts remittance receipt data from PDFs and images without calling a
 
 PDFs can contain multiple unique receipts on separate pages or on the same page. The parser separates each receipt into its own schedule row and consolidates duplicate print copies using stable receipt identifiers such as PRN, payment reference, RRR, or receipt number. Scanned PDF pages are checked in their original orientation and rotated left or right when receipt signals are not detected.
 
+PDF text items are reconstructed into readable lines before parsing, with recovery rules for fragmented receipt numbers and amounts. Incomplete receipts remain visible and are flagged for review instead of being silently discarded.
+
 ## Security Notes
 
 - No Gemini or other LLM API keys are required.

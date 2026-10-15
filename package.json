@@ -7,7 +7,7 @@
     "build:css": "tailwindcss -i ./tailwind.source.css -o ./index.css --minify",
     "dev": "npm run build:css && vite",
     "build": "npm run build:css && vite build",
-    "test": "node --experimental-strip-types --test --experimental-test-isolation=none receiptSegmentation.test.ts",
+    "test": "node --experimental-strip-types --test --experimental-test-isolation=none receiptSegmentation.test.ts receiptRecovery.test.ts",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },

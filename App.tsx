@@ -1,5 +1,11 @@
 import React, { useState } from 'react';
 import { extractUniqueReceiptCandidates } from './receiptSegmentation.ts';
+import {
+    assemblePdfText,
+    extractFallbackAmount,
+    extractFallbackReceiptNumber,
+    hasRecoverableReceiptData
+} from './receiptRecovery.ts';
 
 type MessageType = 'error' | 'success' | 'warning';
 
@@ -684,21 +690,23 @@ const parseReceiptText = (text: string, sourceFile: string): ScannerResult[] => 
         .map(candidate => {
             const state = extractState(candidate.text);
 
-            return normalizeResult(
+            const result = normalizeResult(
                 {
                     identityKey: candidate.identityKey,
                     companyName: extractCompanyName(candidate.text),
                     paymentDate: extractPaymentDate(candidate.text),
                     paymentPeriod: extractPaymentPeriod(candidate.text),
-                    receiptNumber: extractReceiptNumber(candidate.text, state),
+                    receiptNumber: extractReceiptNumber(candidate.text, state) || extractFallbackReceiptNumber(candidate.text),
                     taxType: extractTaxType(candidate.text),
-                    amount: extractAmount(candidate.text),
+                    amount: extractAmount(candidate.text) || extractFallbackAmount(candidate.text),
                     state
                 },
                 sourceFile
             );
+
+            return result;
         })
-        .filter(result => result.amount > 0);
+        .filter(hasRecoverableReceiptData);
 };
 
 interface OcrSession {
@@ -824,7 +832,7 @@ const extractPdfText = async (file: File, onProgress: (message: string) => void)
             onProgress(`${file.name}: reading page ${pageNumber} of ${pdf.numPages}`);
             const page = await pdf.getPage(pageNumber);
             const textContent = await page.getTextContent();
-            const pageText = textContent.items.map((item: any) => item.str || '').join('\n').trim();
+            const pageText = assemblePdfText(textContent.items as Array<{ str?: unknown; hasEOL?: boolean }>);
 
             if (pageText.length > 40) {
                 pageTexts.push(pageText);
@@ -916,6 +924,7 @@ const App: React.FC = () => {
                 const text = await extractTextFromFile(file, setProgressText);
                 const parsedRows = parseReceiptText(text, file.name);
                 let addedCount = 0;
+                let reviewCount = 0;
 
                 for (const row of parsedRows) {
                     const key = row.identityKey || `${row.receiptNumber || row.sourceFile}-${row.amount}-${row.paymentDate}`;
@@ -923,6 +932,7 @@ const App: React.FC = () => {
                     uniqueKeys.add(key);
                     results.push(row);
                     addedCount += 1;
+                    if (!row.receiptNumber || row.amount <= 0) reviewCount += 1;
                 }
 
                 setScannerMessages(previous => [
@@ -930,9 +940,9 @@ const App: React.FC = () => {
                     {
                         text:
                             addedCount > 0
-                                ? `Processed ${file.name}: ${addedCount} row(s) extracted.`
+                                ? `Processed ${file.name}: ${addedCount} row(s) extracted.${reviewCount ? ` ${reviewCount} row(s) need review for a missing receipt number or amount.` : ''}`
                                 : `Processed ${file.name}: no new unique receipts found.`,
-                        type: addedCount > 0 ? 'success' : 'warning'
+                        type: addedCount > 0 && reviewCount === 0 ? 'success' : 'warning'
                     }
                 ]);
             } catch (error: any) {
