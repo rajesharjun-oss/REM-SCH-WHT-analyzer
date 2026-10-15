@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
+import { extractUniqueReceiptCandidates } from './receiptSegmentation.ts';
 
 type MessageType = 'error' | 'success' | 'warning';
 
 interface ScannerResult {
+    identityKey: string;
     companyName: string;
     paymentDate: string;
     paymentDateDisplay: string;
@@ -662,6 +664,7 @@ const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string): Scann
     const state = normalizeState(raw.state ?? '', sourceFile) || inferStateFromTaxContext(taxType, receiptNumber);
 
     return {
+        identityKey: cleanValue(raw.identityKey),
         companyName: normalizeCompanyName(raw.companyName ?? ''),
         paymentDate,
         paymentDateDisplay: formatDateDisplay(paymentDate),
@@ -674,64 +677,38 @@ const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string): Scann
     };
 };
 
-const isReceiptStartChunk = (text: string) => {
-    const hasLagosTopReference = /^\s*\d{6,10}\/[A-Z0-9]{6,}\b/im.test(text);
-    const hasRemitaReference = hasRemitaRrrLabel(text);
-    const hasStrongReceiptDetails =
-        /\b(?:Payment\s+Date|Date\s+of\s+Payment|Total\s+Amount\s+Paid|Customer\s+Name|Taxpayer\s+Name|Payer\s+Name|Payment\s+Ref\.?\s*Number|CBS\s*Reference)\b/i.test(text);
-    const hasReceiptNumberLabel = /\bReceipt\s*(?:No\.?|Number|#|ID)\b/i.test(text);
-
-    return hasLagosTopReference || hasRemitaReference || hasStrongReceiptDetails || hasReceiptNumberLabel;
-};
-
-const groupReceiptChunks = (chunks: string[]) => {
-    if (chunks.length <= 1) return chunks;
-
-    const grouped: string[] = [];
-    for (const chunk of chunks) {
-        if (grouped.length === 0 || isReceiptStartChunk(chunk)) {
-            grouped.push(chunk);
-            continue;
-        }
-
-        grouped[grouped.length - 1] = `${grouped[grouped.length - 1]}\n${chunk}`;
-    }
-
-    return grouped;
-};
-
 const parseReceiptText = (text: string, sourceFile: string): ScannerResult[] => {
-    const normalizedText = normalizeWhitespace(text);
-    const pageChunks = normalizedText
-        .split(/\n\s*\f\s*\n/g)
-        .map(chunk => chunk.trim())
-        .filter(chunk => chunk.length > 30);
-    const candidates = pageChunks.length ? groupReceiptChunks(pageChunks) : [normalizedText];
+    const candidates = extractUniqueReceiptCandidates(normalizeWhitespace(text));
 
-    return candidates.map(candidate => {
-        const state = extractState(candidate);
+    return candidates
+        .map(candidate => {
+            const state = extractState(candidate.text);
 
-        return normalizeResult(
-            {
-                companyName: extractCompanyName(candidate),
-                paymentDate: extractPaymentDate(candidate),
-                paymentPeriod: extractPaymentPeriod(candidate),
-                receiptNumber: extractReceiptNumber(candidate, state),
-                taxType: extractTaxType(candidate),
-                amount: extractAmount(candidate),
-                state
-            },
-            sourceFile
-        );
-    });
+            return normalizeResult(
+                {
+                    identityKey: candidate.identityKey,
+                    companyName: extractCompanyName(candidate.text),
+                    paymentDate: extractPaymentDate(candidate.text),
+                    paymentPeriod: extractPaymentPeriod(candidate.text),
+                    receiptNumber: extractReceiptNumber(candidate.text, state),
+                    taxType: extractTaxType(candidate.text),
+                    amount: extractAmount(candidate.text),
+                    state
+                },
+                sourceFile
+            );
+        })
+        .filter(result => result.amount > 0);
 };
 
-const recognizeText = async (
-    imageLike: File | HTMLCanvasElement,
-    label: string,
-    onProgress: (message: string) => void
-) => {
+interface OcrSession {
+    recognize: (imageLike: File | HTMLCanvasElement, label: string) => Promise<string>;
+    terminate: () => Promise<unknown>;
+}
+
+const createOcrSession = async (onProgress: (message: string) => void): Promise<OcrSession> => {
     const { createWorker } = await import('tesseract.js');
+    let activeLabel = 'OCR';
     const worker = await createWorker('eng', 1, {
         workerPath: `${ocrAssetBasePath}/worker.min.js`,
         corePath: ocrAssetBasePath,
@@ -739,17 +716,85 @@ const recognizeText = async (
         gzip: true,
         logger: (message: any) => {
             if (message.status && typeof message.progress === 'number') {
-                onProgress(`${label}: ${message.status} ${Math.round(message.progress * 100)}%`);
+                onProgress(`${activeLabel}: ${message.status} ${Math.round(message.progress * 100)}%`);
             }
         }
     } as any);
 
+    return {
+        recognize: async (imageLike, label) => {
+            activeLabel = label;
+            const result = await worker.recognize(imageLike as any);
+            return result.data.text || '';
+        },
+        terminate: () => worker.terminate()
+    };
+};
+
+const recognizeText = async (
+    imageLike: File | HTMLCanvasElement,
+    label: string,
+    onProgress: (message: string) => void
+) => {
+    const session = await createOcrSession(onProgress);
     try {
-        const result = await worker.recognize(imageLike as any);
-        return result.data.text || '';
+        return await session.recognize(imageLike, label);
     } finally {
-        await worker.terminate();
+        await session.terminate();
     }
+};
+
+const scoreReceiptOcrText = (text: string) => {
+    const signals: Array<[RegExp, number]> = [
+        [/\bPAYMENT\s+RECEIPT\b/i, 25],
+        [/Payment\s+Reference\s+Number|\bPRN\b/i, 30],
+        [/\bReceipt\s*(?:No\.?|Number|#|ID)\b/i, 25],
+        [/\bTotal\s+Amount\s+Paid\b|\bPayment\s+Amount\b/i, 20],
+        [/\bPayment\s+Date\b|\bDate\s+of\s+Payment\b/i, 15],
+        [/\bCustomer\s+Name\b|\bTaxpayer\s+Name\b|\bPayer\s+Name\b/i, 10]
+    ];
+
+    return signals.reduce((score, [pattern, weight]) => score + (pattern.test(text) ? weight : 0), 0) +
+        Math.min(text.replace(/\s/g, '').length / 100, 10);
+};
+
+const rotateCanvas = (source: HTMLCanvasElement, degrees: 90 | -90) => {
+    const target = document.createElement('canvas');
+    const context = target.getContext('2d');
+    if (!context) throw new Error('Could not initialize rotated PDF page renderer.');
+
+    target.width = source.height;
+    target.height = source.width;
+    context.translate(target.width / 2, target.height / 2);
+    context.rotate((degrees * Math.PI) / 180);
+    context.drawImage(source, -source.width / 2, -source.height / 2);
+    return target;
+};
+
+const recognizePdfPage = async (
+    canvas: HTMLCanvasElement,
+    session: OcrSession,
+    label: string
+) => {
+    const attempts: Array<{ label: string; getCanvas: () => HTMLCanvasElement }> = [
+        { label, getCanvas: () => canvas },
+        { label: `${label} (rotated right)`, getCanvas: () => rotateCanvas(canvas, 90) },
+        { label: `${label} (rotated left)`, getCanvas: () => rotateCanvas(canvas, -90) }
+    ];
+    let bestText = '';
+    let bestScore = -1;
+
+    for (const attempt of attempts) {
+        const text = await session.recognize(attempt.getCanvas(), attempt.label);
+        const score = scoreReceiptOcrText(text);
+        if (score > bestScore) {
+            bestText = text;
+            bestScore = score;
+        }
+        if (score >= 80) break;
+    }
+
+    return bestText;
 };
 
 const renderPageToCanvas = async (page: any) => {
@@ -772,21 +817,27 @@ const extractPdfText = async (file: File, onProgress: (message: string) => void)
     const data = new Uint8Array(await file.arrayBuffer());
     const pdf = await pdfjsLib.getDocument({ data }).promise;
     const pageTexts: string[] = [];
+    let ocrSession: OcrSession | null = null;
 
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-        onProgress(`${file.name}: reading page ${pageNumber} of ${pdf.numPages}`);
-        const page = await pdf.getPage(pageNumber);
-        const textContent = await page.getTextContent();
-        const pageText = textContent.items.map((item: any) => item.str || '').join('\n').trim();
+    try {
+        for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+            onProgress(`${file.name}: reading page ${pageNumber} of ${pdf.numPages}`);
+            const page = await pdf.getPage(pageNumber);
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items.map((item: any) => item.str || '').join('\n').trim();
 
-        if (pageText.length > 40) {
-            pageTexts.push(pageText);
-            continue;
+            if (pageText.length > 40) {
+                pageTexts.push(pageText);
+                continue;
+            }
+
+            const canvas = await renderPageToCanvas(page);
+            ocrSession ??= await createOcrSession(onProgress);
+            const ocrText = await recognizePdfPage(canvas, ocrSession, `${file.name} page ${pageNumber}`);
+            pageTexts.push(ocrText);
         }
-
-        const canvas = await renderPageToCanvas(page);
-        const ocrText = await recognizeText(canvas, `${file.name} page ${pageNumber}`, onProgress);
-        pageTexts.push(ocrText);
+    } finally {
+        await ocrSession?.terminate();
     }
 
     return pageTexts.join('\n\f\n');
@@ -867,7 +918,7 @@ const App: React.FC = () => {
                 let addedCount = 0;
 
                 for (const row of parsedRows) {
-                    const key = `${row.receiptNumber || row.sourceFile}-${row.amount}-${row.paymentDate}`;
+                    const key = row.identityKey || `${row.receiptNumber || row.sourceFile}-${row.amount}-${row.paymentDate}`;
                     if (uniqueKeys.has(key)) continue;
                     uniqueKeys.add(key);
                     results.push(row);

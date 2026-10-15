@@ -6,6 +6,8 @@
 
 This app extracts remittance receipt data from PDFs and images without calling a cloud AI API. It uses browser-side PDF text extraction, bundled OCR for scanned receipts/images, and the existing Excel schedule exports.
 
+PDFs can contain multiple unique receipts on separate pages or on the same page. The parser separates each receipt into its own schedule row and consolidates duplicate print copies using stable receipt identifiers such as PRN, payment reference, RRR, or receipt number. Scanned PDF pages are checked in their original orientation and rotated left or right when receipt signals are not detected.
+
 ## Security Notes
 
 - No Gemini or other LLM API keys are required.
@@ -24,3 +26,5 @@ This app extracts remittance receipt data from PDFs and images without calling a
    `npm run dev`
 3. Build for deployment:
    `npm run build`
+4. Run the parser regression tests:
+   `npm test`
