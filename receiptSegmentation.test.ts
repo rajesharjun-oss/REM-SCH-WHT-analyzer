@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { extractReceiptIdentity, extractUniqueReceiptCandidates } from './receiptSegmentation.ts';
+import {
+    extractReceiptCandidatesWithSummary,
+    extractReceiptIdentity,
+    extractUniqueReceiptCandidates
+} from './receiptSegmentation.ts';
 
 const firsReceipt = (prn: string, receiptNumber: string, amount: string) => `
 FIRS TAXPROMAX
@@ -26,11 +30,20 @@ test('extracts multiple unique receipts across pages and removes duplicate print
     assert.deepEqual(
         candidates.map(candidate => candidate.identityKey),
         [
-            'prn:1752838076-10591066',
-            'prn:1752837458-10591060',
-            'prn:1752838371-10591070'
+            'receipt:2538588903',
+            'receipt:2538588909',
+            'receipt:2538588913'
         ]
     );
+});
+
+test('reports duplicate print copies excluded from a PDF', () => {
+    const firstReceipt = firsReceipt('1752838076-10591066', '2538588903', '106,892,056.70');
+    const secondReceipt = firsReceipt('1752837458-10591060', '2538588909', '207,465,190.91');
+    const summary = extractReceiptCandidatesWithSummary(`${firstReceipt}\n${firstReceipt}\n\f\n${secondReceipt}\n${secondReceipt}`);
+
+    assert.equal(summary.candidates.length, 2);
+    assert.equal(summary.duplicateCount, 2);
 });
 
 test('extracts two unique receipts printed on the same PDF page', () => {

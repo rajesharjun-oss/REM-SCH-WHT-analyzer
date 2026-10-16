@@ -3,6 +3,11 @@ export interface ReceiptCandidate {
     identityKey: string;
 }
 
+export interface ReceiptCandidateSummary {
+    candidates: ReceiptCandidate[];
+    duplicateCount: number;
+}
+
 const samePageReceiptStartPatterns = [
     /(?:FIRS\s+TAXPROMAX\s+)?PAYMENT\s+RECEIPT\b/gi,
     /Payment\s+Reference\s+Number\s*(?:\(\s*PRN\s*\))?\s*[:#=-]?/gi,
@@ -89,10 +94,10 @@ const cleanIdentityValue = (value: string) =>
 
 export const extractReceiptIdentity = (text: string) => {
     const identityPatterns: Array<[string, RegExp]> = [
+        ['receipt', /Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9|/_-]{5,})/i],
         ['prn', /Payment\s+Reference\s+Number\s*\(\s*PRN\s*\)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9|/_-]{5,})/i],
         ['payment-ref', /Payment\s+Ref(?:erence)?\.?\s+Number\s*[:#=-]?\s*([A-Z0-9][A-Z0-9|/_-]{5,})/i],
         ['rrr', /(?:Remita\s+Retrieval\s+Reference|RRR)\s*(?:Number|No\.?)?\s*[:#=-]?\s*([A-Z0-9][A-Z0-9|/_-]{5,})/i],
-        ['receipt', /Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9|/_-]{5,})/i],
         ['lagos-ref', /^\s*(\d{6,10}\/[A-Z0-9]{6,})\b/im]
     ];
 
@@ -119,9 +124,9 @@ const fingerprintText = (text: string) => {
     return `content:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 };
 
-export const extractUniqueReceiptCandidates = (text: string): ReceiptCandidate[] => {
+export const extractReceiptCandidatesWithSummary = (text: string): ReceiptCandidateSummary => {
     const normalizedText = normalizeForSegmentation(text);
-    if (!normalizedText) return [];
+    if (!normalizedText) return { candidates: [], duplicateCount: 0 };
 
     const pages = normalizedText
         .split(/\n*\f\n*/g)
@@ -131,14 +136,21 @@ export const extractUniqueReceiptCandidates = (text: string): ReceiptCandidate[]
     const groupedChunks = groupContinuationChunks(pageChunks);
     const seen = new Set<string>();
     const candidates: ReceiptCandidate[] = [];
+    let duplicateCount = 0;
 
     for (const candidateText of groupedChunks) {
         const identityKey = extractReceiptIdentity(candidateText) || fingerprintText(candidateText);
-        if (seen.has(identityKey)) continue;
+        if (seen.has(identityKey)) {
+            duplicateCount += 1;
+            continue;
+        }
 
         seen.add(identityKey);
         candidates.push({ text: candidateText, identityKey });
     }
 
-    return candidates;
+    return { candidates, duplicateCount };
 };
+
+export const extractUniqueReceiptCandidates = (text: string): ReceiptCandidate[] =>
+    extractReceiptCandidatesWithSummary(text).candidates;

@@ -10,6 +10,21 @@ PDFs can contain multiple unique receipts on separate pages or on the same page.
 
 PDF text items are reconstructed into readable lines before parsing, with recovery rules for fragmented receipt numbers and amounts. Incomplete receipts remain visible and are flagged for review instead of being silently discarded.
 
+## Receipt Review Workflow
+
+The extraction flow is optimized for uploaded receipts and captures the fields required for a remittance schedule:
+
+- payment date;
+- payment period;
+- canonical tax type such as PAYE, WHT, VAT, or WVAT;
+- receipt number, or a clearly labelled alternative identifier when no receipt number is available;
+- amount paid; and
+- remarks, including details such as `WHT on Rent`.
+
+Detailed WHT descriptions are normalized to `WHT` for grouping while the description is retained in remarks. Periods inferred from a filename or payment date, alternative identifiers, generic tax types, and missing required fields are highlighted in the editable review table. Schedule downloads remain disabled until every review item is corrected or confirmed.
+
+The reconciliation summary shows uploaded files, unique receipts, review status, duplicate print copies excluded, and the extracted total before export.
+
 ## Security Notes
 
 - No Gemini or other LLM API keys are required.

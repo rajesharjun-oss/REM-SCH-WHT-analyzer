@@ -1,11 +1,20 @@
 import React, { useState } from 'react';
-import { extractUniqueReceiptCandidates } from './receiptSegmentation.ts';
+import { extractReceiptCandidatesWithSummary } from './receiptSegmentation.ts';
 import {
     assemblePdfText,
     extractFallbackAmount,
     extractFallbackReceiptNumber,
     hasRecoverableReceiptData
 } from './receiptRecovery.ts';
+import {
+    assessReceiptReview,
+    createReceiptDeduplicationKey,
+    detectIdentifierType,
+    normalizeTaxDetails,
+    type ConfidenceLevel,
+    type IdentifierType,
+    type PeriodSource
+} from './receiptReview.ts';
 
 type MessageType = 'error' | 'success' | 'warning';
 
@@ -15,11 +24,18 @@ interface ScannerResult {
     paymentDate: string;
     paymentDateDisplay: string;
     paymentPeriod: string;
+    paymentPeriodSource: PeriodSource;
     receiptNumber: string;
+    identifierType: IdentifierType;
     taxType: string;
     amount: number;
+    remarks: string;
     state: string;
     sourceFile: string;
+    confidence: ConfidenceLevel;
+    confidenceScore: number;
+    reviewIssues: string[];
+    reviewed: boolean;
 }
 
 const monthLookup: Record<string, number> = {
@@ -94,6 +110,20 @@ const nigerianStates = [
     'Taraba',
     'Yobe',
     'Zamfara'
+];
+
+const commonTaxTypes = ['PAYE', 'WHT', 'VAT', 'WVAT', 'Development Levy', 'Stamp Duty'];
+const identifierTypes: IdentifierType[] = [
+    'Receipt Number',
+    'PRN',
+    'RRR',
+    'Payment Reference',
+    'Transaction Reference',
+    'Deposit Slip Number',
+    'CBS Reference',
+    'Session ID',
+    'Other',
+    'Missing'
 ];
 
 
@@ -397,16 +427,15 @@ const extractReceiptNumber = (text: string, stateHint = '') => {
 
     const highestPriorityPatterns: ReceiptPattern[] = [
         { regex: /^\s*(\d{6,10}\/[A-Z0-9]{6,})\b/im },
+        { regex: /(?:^|\n)\s*(?:Official\s+)?(?:e-?\s*)?Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
+        { regex: /(?:^|\n)\s*Receipt\s*[:#=-]\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
+        { regex: /(?:^|\n)\s*(?:Payment|Tax)\s+Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
         {
             regex: /(?:Remita\s+Retrieval\s+Reference(?:\s*\(?RRR\)?)?|RRR)\s*[:#=-]*\s*(\d{4}[-\s]?\d{4}[-\s]?\d{4}|\d{12})/i,
             cleaner: cleanRrrCandidate
         },
-        { regex: /(?:^|\n)\s*(?:Official\s+)?(?:e-?\s*)?Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
-        { regex: /(?:^|\n)\s*Receipt\s*[:#=-]\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
-        { regex: /(?:^|\n)\s*(?:Payment|Tax)\s+Receipt\s*(?:No\.?|Number|#|ID)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})/im },
         { regex: /(?:^|\n)\s*KRN\s*[:#=-]?\s*(\d{12})/im, cleaner: cleanRrrCandidate, allowForPaydirect: false },
-        { regex: /(?:Session\s*ID)\s*[:#=-]?\s*([0-9]{10,40})/i, allowForPaydirect: false },
-        { regex: /(?:Invoice\s*No\.?|Invoice\s*Number|Invoicenumber)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9/_-]{5,30})/i, allowForPaydirect: false }
+        { regex: /(?:Session\s*ID)\s*[:#=-]?\s*([0-9]{10,40})/i, allowForPaydirect: false }
     ];
     const highestPriorityReceiptNumber = findReceiptPattern(text, highestPriorityPatterns, context);
     if (highestPriorityReceiptNumber) return highestPriorityReceiptNumber;
@@ -653,21 +682,43 @@ const extractAmount = (text: string) => {
     return Math.max(...matches);
 };
 
-const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string): ScannerResult => {
+const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string, receiptText = ''): ScannerResult => {
     const paymentDate = parseDateToIso(raw.paymentDate ?? '') || cleanValue(raw.paymentDate);
-    const extractedPaymentPeriod = normalizePeriod(raw.paymentPeriod ?? '', paymentDate);
+    const rawPaymentPeriod = cleanValue(raw.paymentPeriod);
     const sourceFilePeriod = normalizeSourceFilePeriod(sourceFile, paymentDate);
-    const paymentPeriod =
-        (/^\d{4}$/.test(extractedPaymentPeriod) || isUnusablePaymentPeriod(extractedPaymentPeriod)) && sourceFilePeriod
-            ? sourceFilePeriod
-            : extractedPaymentPeriod;
+    let paymentPeriodSource: PeriodSource = 'missing';
+    let paymentPeriod = '';
+
+    if (rawPaymentPeriod && !isUnusablePaymentPeriod(rawPaymentPeriod)) {
+        paymentPeriod = normalizePeriod(rawPaymentPeriod, paymentDate);
+        paymentPeriodSource = 'receipt';
+    } else if (sourceFilePeriod) {
+        paymentPeriod = sourceFilePeriod;
+        paymentPeriodSource = 'filename';
+    } else if (paymentDate) {
+        paymentPeriod = derivePreviousPeriod(paymentDate);
+        paymentPeriodSource = paymentPeriod ? 'payment-date' : 'missing';
+    }
+
     const amount =
         typeof raw.amount === 'number'
             ? raw.amount
             : parseAmount(String(raw.amount ?? '')) ?? 0;
     const receiptNumber = cleanValue(raw.receiptNumber);
-    const taxType = normalizeTaxTypeForSource(raw.taxType ?? '', sourceFile);
+    const normalizedTaxType = normalizeTaxTypeForSource(raw.taxType ?? '', sourceFile);
+    const taxDetails = normalizeTaxDetails(normalizedTaxType, receiptText);
+    const taxType = taxDetails.taxType;
+    const identifierType = raw.identifierType ?? detectIdentifierType(receiptText, receiptNumber);
     const state = normalizeState(raw.state ?? '', sourceFile) || inferStateFromTaxContext(taxType, receiptNumber);
+    const assessment = assessReceiptReview({
+        paymentDate,
+        paymentPeriod,
+        paymentPeriodSource,
+        receiptNumber,
+        identifierType,
+        taxType,
+        amount
+    });
 
     return {
         identityKey: cleanValue(raw.identityKey),
@@ -675,18 +726,23 @@ const normalizeResult = (raw: Partial<ScannerResult>, sourceFile: string): Scann
         paymentDate,
         paymentDateDisplay: formatDateDisplay(paymentDate),
         paymentPeriod,
+        paymentPeriodSource,
         receiptNumber,
+        identifierType,
         taxType,
         amount,
+        remarks: cleanValue(raw.remarks) || taxDetails.remarks,
         state,
-        sourceFile
+        sourceFile,
+        ...assessment,
+        reviewed: Boolean(raw.reviewed)
     };
 };
 
-const parseReceiptText = (text: string, sourceFile: string): ScannerResult[] => {
-    const candidates = extractUniqueReceiptCandidates(normalizeWhitespace(text));
+const parseReceiptText = (text: string, sourceFile: string) => {
+    const { candidates, duplicateCount } = extractReceiptCandidatesWithSummary(normalizeWhitespace(text));
 
-    return candidates
+    const rows = candidates
         .map(candidate => {
             const state = extractState(candidate.text);
 
@@ -701,12 +757,15 @@ const parseReceiptText = (text: string, sourceFile: string): ScannerResult[] => 
                     amount: extractAmount(candidate.text) || extractFallbackAmount(candidate.text),
                     state
                 },
-                sourceFile
+                sourceFile,
+                candidate.text
             );
 
             return result;
         })
         .filter(hasRecoverableReceiptData);
+
+    return { rows, duplicateCount };
 };
 
 interface OcrSession {
@@ -874,6 +933,7 @@ const App: React.FC = () => {
     const [scannerMessages, setScannerMessages] = useState<{ text: string; type: MessageType }[]>([]);
     const [showDownloadModal, setShowDownloadModal] = useState(false);
     const [progressText, setProgressText] = useState('');
+    const [duplicateCount, setDuplicateCount] = useState(0);
 
     const handleFileChange = (files: FileList | null) => {
         if (!files) return;
@@ -881,6 +941,7 @@ const App: React.FC = () => {
         setScannerResults([]);
         setScannerMessages([]);
         setProgressText('');
+        setDuplicateCount(0);
     };
 
     const handleDragOver = (event: React.DragEvent) => event.preventDefault();
@@ -895,9 +956,11 @@ const App: React.FC = () => {
         setScannerMessages([]);
         setScannerResults([]);
         setProgressText('');
+        setDuplicateCount(0);
 
         const uniqueKeys = new Set<string>();
         const results: ScannerResult[] = [];
+        let duplicatesExcluded = 0;
 
         for (const file of selectedFiles) {
             if (file.size > 30 * 1024 * 1024) {
@@ -922,17 +985,22 @@ const App: React.FC = () => {
 
             try {
                 const text = await extractTextFromFile(file, setProgressText);
-                const parsedRows = parseReceiptText(text, file.name);
+                const parsed = parseReceiptText(text, file.name);
+                const parsedRows = parsed.rows;
+                duplicatesExcluded += parsed.duplicateCount;
                 let addedCount = 0;
                 let reviewCount = 0;
 
                 for (const row of parsedRows) {
-                    const key = row.identityKey || `${row.receiptNumber || row.sourceFile}-${row.amount}-${row.paymentDate}`;
-                    if (uniqueKeys.has(key)) continue;
+                    const key = createReceiptDeduplicationKey(row);
+                    if (uniqueKeys.has(key)) {
+                        duplicatesExcluded += 1;
+                        continue;
+                    }
                     uniqueKeys.add(key);
                     results.push(row);
                     addedCount += 1;
-                    if (!row.receiptNumber || row.amount <= 0) reviewCount += 1;
+                    if (row.reviewIssues.length > 0) reviewCount += 1;
                 }
 
                 setScannerMessages(previous => [
@@ -940,7 +1008,7 @@ const App: React.FC = () => {
                     {
                         text:
                             addedCount > 0
-                                ? `Processed ${file.name}: ${addedCount} row(s) extracted.${reviewCount ? ` ${reviewCount} row(s) need review for a missing receipt number or amount.` : ''}`
+                                ? `Processed ${file.name}: ${addedCount} receipt(s) extracted.${reviewCount ? ` ${reviewCount} receipt(s) need review.` : ''}`
                                 : `Processed ${file.name}: no new unique receipts found.`,
                         type: addedCount > 0 && reviewCount === 0 ? 'success' : 'warning'
                     }
@@ -955,15 +1023,54 @@ const App: React.FC = () => {
 
         results.sort((a, b) => new Date(a.paymentDate || 0).getTime() - new Date(b.paymentDate || 0).getTime());
         setScannerResults(results);
+        setDuplicateCount(duplicatesExcluded);
         setProgressText('');
         setScannerIsLoading(false);
     };
 
+    const updateScannerResult = (
+        index: number,
+        field: 'paymentDate' | 'paymentPeriod' | 'state' | 'receiptNumber' | 'identifierType' | 'taxType' | 'amount' | 'remarks',
+        value: string
+    ) => {
+        setScannerResults(previous => previous.map((row, rowIndex) => {
+            if (rowIndex !== index) return row;
+
+            const updated: ScannerResult = {
+                ...row,
+                [field]: field === 'amount' ? Number(value) : value,
+                reviewed: false
+            };
+
+            if (field === 'paymentDate') updated.paymentDateDisplay = formatDateDisplay(value);
+            if (field === 'paymentPeriod') updated.paymentPeriodSource = value ? 'receipt' : 'missing';
+            if (field === 'receiptNumber' && row.identifierType === 'Missing' && value) updated.identifierType = 'Other';
+
+            const assessment = assessReceiptReview(updated);
+            return { ...updated, ...assessment };
+        }));
+    };
+
+    const confirmScannerResult = (index: number) => {
+        setScannerResults(previous => previous.map((row, rowIndex) => {
+            if (rowIndex !== index) return row;
+            const hasMissingRequiredField = row.reviewIssues.some(issue => /missing|invalid/i.test(issue));
+            return hasMissingRequiredField ? row : { ...row, reviewed: true };
+        }));
+    };
+
+    const receiptsNeedingReview = scannerResults.filter(row => row.reviewIssues.length > 0 && !row.reviewed).length;
+    const readyReceiptCount = scannerResults.length - receiptsNeedingReview;
+    const extractedTotal = scannerResults.reduce((sum, row) => sum + (row.amount || 0), 0);
+    const canDownload = scannerResults.length > 0 && receiptsNeedingReview === 0;
+
     const handleDownloadClick = () => {
+        if (!canDownload) return;
         setShowDownloadModal(true);
     };
 
     const handleDownloadConfirm = (type: 'standard' | 'upload') => {
+        if (!canDownload) return;
         setShowDownloadModal(false);
         void downloadScannerExcel(type);
     };
@@ -1103,9 +1210,9 @@ const App: React.FC = () => {
                 XLSX.utils.sheet_add_aoa(ws, [[`${state.toUpperCase()} REMITTANCE SCHEDULE FOR ${year}`]], { origin: 'A2' });
                 if (ws['A2']) ws['A2'].s = { font: { bold: true, sz: 12 } };
 
-                const headers = ['PAYMENT DATE', 'PERIOD', 'RECEIPT NUMBER', 'TAX TYPE', 'AMOUNT [N]'];
+                const headers = ['PAYMENT DATE', 'PERIOD', 'RECEIPT NUMBER', 'TAX TYPE', 'AMOUNT [N]', 'REMARKS'];
                 XLSX.utils.sheet_add_aoa(ws, [headers], { origin: 'A4' });
-                ['A4', 'B4', 'C4', 'D4', 'E4'].forEach(ref => {
+                ['A4', 'B4', 'C4', 'D4', 'E4', 'F4'].forEach(ref => {
                     if (ws[ref]) ws[ref].s = headerStyle;
                 });
 
@@ -1126,7 +1233,7 @@ const App: React.FC = () => {
 
                         XLSX.utils.sheet_add_aoa(ws, [[groupKey]], { origin: { r: currentWriteRow, c: 0 } });
                         if (!ws['!merges']) ws['!merges'] = [];
-                        ws['!merges'].push({ s: { r: currentWriteRow, c: 0 }, e: { r: currentWriteRow, c: 4 } });
+                        ws['!merges'].push({ s: { r: currentWriteRow, c: 0 }, e: { r: currentWriteRow, c: 5 } });
 
                         const sectionCell = XLSX.utils.encode_cell({ r: currentWriteRow, c: 0 });
                         if (ws[sectionCell]) {
@@ -1144,7 +1251,8 @@ const App: React.FC = () => {
                             row.paymentPeriod,
                             row.receiptNumber,
                             row.taxType,
-                            row.amount
+                            row.amount,
+                            row.remarks
                         ]);
 
                         XLSX.utils.sheet_add_aoa(ws, rowsToAdd, { origin: { r: currentWriteRow, c: 0 } });
@@ -1155,7 +1263,7 @@ const App: React.FC = () => {
                                 ws[dateRef].z = 'dd/mm/yyyy';
                                 ws[dateRef].s = { ...dataStyle, alignment: { horizontal: 'center' } };
                             }
-                            [1, 2, 3].forEach(columnIndex => {
+                            [1, 2, 3, 5].forEach(columnIndex => {
                                 const ref = XLSX.utils.encode_cell({ c: columnIndex, r: rowIndex });
                                 if (ws[ref]) ws[ref].s = dataStyle;
                             });
@@ -1194,7 +1302,7 @@ const App: React.FC = () => {
                     ws[totalValRef].s = { font: { bold: true }, border: { bottom: { style: 'double' } } };
                 }
 
-                ws['!cols'] = [{ wch: 15 }, { wch: 12 }, { wch: 35 }, { wch: 30 }, { wch: 20 }];
+                ws['!cols'] = [{ wch: 15 }, { wch: 12 }, { wch: 35 }, { wch: 18 }, { wch: 20 }, { wch: 30 }];
                 XLSX.utils.book_append_sheet(wb, ws, `${state} ${year}`.substring(0, 31));
             }
         }
@@ -1329,40 +1437,178 @@ const App: React.FC = () => {
 
                     {scannerResults.length > 0 && (
                         <div className="bg-slate-900/50 backdrop-blur-sm rounded-xl shadow-lg overflow-hidden glow-border">
-                            <div className="px-6 py-4 bg-slate-900/70 border-b border-white/10 flex justify-between items-center">
-                                <h2 className="text-lg font-semibold text-violet-300">Scanner Results</h2>
+                            <div className="px-6 py-4 bg-slate-900/70 border-b border-white/10 flex flex-col gap-4 lg:flex-row lg:justify-between lg:items-center">
+                                <div>
+                                    <h2 className="text-lg font-semibold text-violet-300">Receipt Review</h2>
+                                    <p className="mt-1 text-sm text-slate-400">Confirm highlighted fields before generating the schedule.</p>
+                                </div>
                                 <button
                                     onClick={handleDownloadClick}
-                                    className="px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-teal-600 hover:bg-teal-700 transition-colors"
+                                    disabled={!canDownload}
+                                    title={canDownload ? 'Generate the remittance schedule' : 'Resolve or confirm every review item first'}
+                                    className="px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-teal-600 hover:bg-teal-700 transition-colors disabled:bg-slate-700 disabled:text-slate-400 disabled:cursor-not-allowed"
                                 >
                                     Download Schedule
                                 </button>
                             </div>
+                            <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 p-4 border-b border-white/10 bg-slate-950/40">
+                                <div className="rounded-lg border border-white/10 p-3">
+                                    <p className="text-xs uppercase tracking-wider text-slate-500">Files</p>
+                                    <p className="mt-1 text-xl font-semibold text-slate-100">{selectedFiles.length}</p>
+                                </div>
+                                <div className="rounded-lg border border-white/10 p-3">
+                                    <p className="text-xs uppercase tracking-wider text-slate-500">Receipts</p>
+                                    <p className="mt-1 text-xl font-semibold text-slate-100">{scannerResults.length}</p>
+                                </div>
+                                <div className="rounded-lg border border-white/10 p-3">
+                                    <p className="text-xs uppercase tracking-wider text-slate-500">Ready</p>
+                                    <p className="mt-1 text-xl font-semibold text-teal-200">{readyReceiptCount}</p>
+                                </div>
+                                <div className="rounded-lg border border-white/10 p-3">
+                                    <p className="text-xs uppercase tracking-wider text-slate-500">Needs Review</p>
+                                    <p className="mt-1 text-xl font-semibold text-yellow-200">{receiptsNeedingReview}</p>
+                                </div>
+                                <div className="rounded-lg border border-white/10 p-3">
+                                    <p className="text-xs uppercase tracking-wider text-slate-500">Total</p>
+                                    <p className="mt-1 text-base font-semibold text-slate-100">{formatCurrency(extractedTotal)}</p>
+                                    {duplicateCount > 0 && <p className="mt-1 text-xs text-slate-500">{duplicateCount} duplicate(s) excluded</p>}
+                                </div>
+                            </div>
                             <div className="overflow-x-auto">
-                                <table className="min-w-full">
+                                <table className="min-w-full text-sm">
                                     <thead className="bg-slate-900/70">
                                         <tr>
-                                            <th className="px-6 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Payment Date</th>
-                                            <th className="px-6 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Period</th>
-                                            <th className="px-6 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">State</th>
-                                            <th className="px-6 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Receipt No.</th>
-                                            <th className="px-6 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Tax Type</th>
-                                            <th className="px-6 py-3 text-right text-xs font-medium text-violet-300 uppercase tracking-wider">Amount</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Date</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Period</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Tax Type</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Receipt / ID</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">ID Type</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Amount</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Remarks</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">State</th>
+                                            <th className="px-3 py-3 text-left text-xs font-medium text-violet-300 uppercase tracking-wider">Review</th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-white/10">
-                                        {scannerResults.map((result, index) => (
-                                            <tr key={`${result.receiptNumber}-${index}`} className="hover:bg-slate-800/40 transition-colors">
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-300">{result.paymentDateDisplay}</td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-300">{result.paymentPeriod}</td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-300">{result.state}</td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-300">{result.receiptNumber}</td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-300">{result.taxType}</td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-300 text-right">{formatCurrency(result.amount)}</td>
-                                            </tr>
-                                        ))}
+                                        {scannerResults.map((result, index) => {
+                                            const needsReview = result.reviewIssues.length > 0 && !result.reviewed;
+                                            const hasMissingRequiredField = result.reviewIssues.some(issue => /missing|invalid/i.test(issue));
+                                            const inputClass = 'w-36 rounded-md border border-white/10 bg-slate-950/60 px-2 py-2 text-sm text-slate-200 focus:border-violet-400 focus:outline-none';
+
+                                            return (
+                                                <tr
+                                                    key={`${result.identityKey}-${result.sourceFile}-${index}`}
+                                                    className={`${needsReview ? 'bg-yellow-950/20' : 'hover:bg-slate-800/40'} transition-colors align-top`}
+                                                >
+                                                    <td className="px-3 py-3">
+                                                        <input
+                                                            type="date"
+                                                            value={result.paymentDate}
+                                                            onChange={event => updateScannerResult(index, 'paymentDate', event.target.value)}
+                                                            aria-label={`Payment date for receipt ${index + 1}`}
+                                                            className={inputClass}
+                                                        />
+                                                    </td>
+                                                    <td className="px-3 py-3">
+                                                        <input
+                                                            value={result.paymentPeriod}
+                                                            onChange={event => updateScannerResult(index, 'paymentPeriod', event.target.value)}
+                                                            aria-label={`Payment period for receipt ${index + 1}`}
+                                                            placeholder="Jan-26"
+                                                            className={inputClass}
+                                                        />
+                                                    </td>
+                                                    <td className="px-3 py-3">
+                                                        <input
+                                                            list="tax-type-options"
+                                                            value={result.taxType}
+                                                            onChange={event => updateScannerResult(index, 'taxType', event.target.value)}
+                                                            aria-label={`Tax type for receipt ${index + 1}`}
+                                                            className={inputClass}
+                                                        />
+                                                    </td>
+                                                    <td className="px-3 py-3">
+                                                        <input
+                                                            value={result.receiptNumber}
+                                                            onChange={event => updateScannerResult(index, 'receiptNumber', event.target.value)}
+                                                            aria-label={`Receipt identifier for receipt ${index + 1}`}
+                                                            className="w-52 rounded-md border border-white/10 bg-slate-950/60 px-2 py-2 text-sm text-slate-200 focus:border-violet-400 focus:outline-none"
+                                                        />
+                                                        <p className="mt-1 max-w-52 truncate text-xs text-slate-500" title={result.sourceFile}>{result.sourceFile}</p>
+                                                    </td>
+                                                    <td className="px-3 py-3">
+                                                        <select
+                                                            value={result.identifierType}
+                                                            onChange={event => updateScannerResult(index, 'identifierType', event.target.value)}
+                                                            aria-label={`Identifier type for receipt ${index + 1}`}
+                                                            className="w-44 rounded-md border border-white/10 bg-slate-950/60 px-2 py-2 text-sm text-slate-200 focus:border-violet-400 focus:outline-none"
+                                                        >
+                                                            {identifierTypes.map(type => <option key={type} value={type}>{type}</option>)}
+                                                        </select>
+                                                    </td>
+                                                    <td className="px-3 py-3">
+                                                        <input
+                                                            type="number"
+                                                            min="0"
+                                                            step="0.01"
+                                                            value={result.amount || ''}
+                                                            onChange={event => updateScannerResult(index, 'amount', event.target.value)}
+                                                            aria-label={`Amount for receipt ${index + 1}`}
+                                                            className={inputClass}
+                                                        />
+                                                    </td>
+                                                    <td className="px-3 py-3">
+                                                        <input
+                                                            value={result.remarks}
+                                                            onChange={event => updateScannerResult(index, 'remarks', event.target.value)}
+                                                            aria-label={`Remarks for receipt ${index + 1}`}
+                                                            className="w-48 rounded-md border border-white/10 bg-slate-950/60 px-2 py-2 text-sm text-slate-200 focus:border-violet-400 focus:outline-none"
+                                                        />
+                                                    </td>
+                                                    <td className="px-3 py-3">
+                                                        <input
+                                                            value={result.state}
+                                                            onChange={event => updateScannerResult(index, 'state', event.target.value)}
+                                                            aria-label={`Optional state for receipt ${index + 1}`}
+                                                            className={inputClass}
+                                                        />
+                                                    </td>
+                                                    <td className="min-w-64 px-3 py-3">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className={`rounded-full px-2 py-1 text-xs font-medium ${
+                                                                result.reviewed || result.reviewIssues.length === 0
+                                                                    ? 'bg-teal-900/50 text-teal-200'
+                                                                    : result.confidence === 'low'
+                                                                        ? 'bg-red-900/50 text-red-200'
+                                                                        : 'bg-yellow-900/50 text-yellow-200'
+                                                            }`}>
+                                                                {result.reviewed ? 'Confirmed' : `${result.confidenceScore}% ${result.confidence}`}
+                                                            </span>
+                                                        </div>
+                                                        {needsReview && (
+                                                            <ul className="mt-2 space-y-1 text-xs text-yellow-200">
+                                                                {result.reviewIssues.map(issue => <li key={issue}>• {issue}</li>)}
+                                                            </ul>
+                                                        )}
+                                                        {result.reviewIssues.length > 0 && (
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => confirmScannerResult(index)}
+                                                                disabled={hasMissingRequiredField || result.reviewed}
+                                                                className="mt-2 rounded-md border border-violet-400/40 px-3 py-1 text-xs text-violet-200 hover:bg-violet-900/40 disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-500"
+                                                            >
+                                                                {result.reviewed ? 'Confirmed' : 'Confirm values'}
+                                                            </button>
+                                                        )}
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })}
                                     </tbody>
                                 </table>
+                                <datalist id="tax-type-options">
+                                    {commonTaxTypes.map(type => <option key={type} value={type} />)}
+                                </datalist>
                             </div>
                         </div>
                     )}
